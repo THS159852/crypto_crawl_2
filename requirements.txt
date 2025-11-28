@@ -1,6 +1,7 @@
-requests
-beautifulsoup4
 python-telegram-bot
+python-dotenv
+ccxt
 pandas
 mplfinance
-ccxt
+requests
+httpx
