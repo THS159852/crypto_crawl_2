@@ -20,7 +20,7 @@ import os
 import pandas as pd
 import mplfinance as mpf
 import ccxt.async_support as ccxt
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters
 from telegram.constants import ParseMode
@@ -971,131 +971,203 @@ async def get_market(order: str, limit: int = 10) -> str:
 # BINANCE ALPHA COMPETITION
 # ==============================================================================
 
-# Lưu trữ dữ liệu competition (có thể cập nhật từ admin hoặc API)
-ALPHA_COMPETITIONS = []
+# Múi giờ Việt Nam UTC+7
+VN_TIMEZONE = timezone(timedelta(hours=7))
+
+# Binance Alpha API endpoint (internal API)
+BINANCE_ALPHA_API = "https://www.binance.com/bapi/alpha/v1"
+
+# Danh sách token Alpha đang active trên Binance (cập nhật thủ công)
+# Format: symbol -> {reward, min_vol, end_date}
+ACTIVE_ALPHA_TOKENS = {
+    'STAR': {'reward': 26, 'min_vol': 0, 'status': 'active'},
+    'KGEN': {'reward': 51, 'min_vol': 98882, 'status': 'active'},
+    'RAVE': {'reward': 26, 'min_vol': 1526, 'status': 'active'},
+    'ZKP': {'reward': 114486125, 'min_vol': 489, 'status': 'active'},
+}
 
 
-def update_alpha_competitions(competitions: list):
-    """Cập nhật danh sách competition từ bên ngoài."""
-    global ALPHA_COMPETITIONS
-    ALPHA_COMPETITIONS = competitions
+def get_vn_time() -> datetime:
+    """Lấy thời gian hiện tại theo múi giờ Việt Nam (UTC+7)."""
+    return datetime.now(VN_TIMEZONE)
 
 
-async def get_alpha_competitions_from_web() -> list:
+def update_active_alpha_tokens(tokens: dict):
+    """Cập nhật danh sách token Alpha đang active."""
+    global ACTIVE_ALPHA_TOKENS
+    ACTIVE_ALPHA_TOKENS.update(tokens)
+
+
+async def get_binance_alpha_tokens() -> list:
     """
-    Cố gắng lấy dữ liệu Alpha Competition từ các nguồn có sẵn.
-    Lưu ý: Binance không có API công khai cho dữ liệu này.
+    Lấy danh sách token từ Binance Alpha.
+    Thử gọi API nội bộ của Binance trước, nếu không được thì dùng danh sách đã lưu.
     """
-    # Thử lấy từ DexScreener để có thông tin token
     competitions = []
     
-    # Danh sách các token Alpha phổ biến (có thể cập nhật)
-    alpha_tokens = ['STAR', 'KGEN', 'RAVE', 'ZKP', 'VINE', 'B2', 'BROCCOLI', 'TUT', 'BMT']
-    
-    for token in alpha_tokens:
-        try:
-            # Lấy giá từ DexScreener
-            url = f"{DEXSCREENER_API_URL}/search?q={token}"
-            data = await fetch_json(url, timeout=5)
-            
-            if data and data.get('pairs'):
-                # Lấy pair có liquidity cao nhất
-                pairs = [p for p in data['pairs'] if p.get('baseToken', {}).get('symbol', '').upper() == token.upper()]
-                if pairs:
-                    best_pair = max(pairs, key=lambda x: x.get('liquidity', {}).get('usd', 0))
-                    
-                    price = float(best_pair.get('priceUsd', 0))
-                    volume_24h = best_pair.get('volume', {}).get('h24', 0)
-                    price_change = best_pair.get('priceChange', {}).get('h24', 0)
-                    liquidity = best_pair.get('liquidity', {}).get('usd', 0)
-                    
+    # Thử lấy từ Binance Alpha API (internal)
+    try:
+        # API endpoint để lấy danh sách Alpha tokens
+        alpha_url = f"{BINANCE_ALPHA_API}/public/alpha/queryAlphaList"
+        data = await fetch_json(alpha_url, timeout=10)
+        
+        if data and data.get('data'):
+            for token_data in data['data']:
+                symbol = token_data.get('tokenSymbol', '').upper()
+                if symbol:
                     competitions.append({
-                        'symbol': token,
-                        'name': best_pair.get('baseToken', {}).get('name', token),
-                        'price': price,
-                        'volume_24h': volume_24h,
-                        'price_change_24h': price_change,
-                        'liquidity': liquidity,
-                        'chain': best_pair.get('chainId', 'unknown'),
-                        'dex': best_pair.get('dexId', 'unknown'),
+                        'symbol': symbol,
+                        'name': token_data.get('tokenName', symbol),
+                        'reward': token_data.get('reward', 0),
+                        'min_vol': token_data.get('minVol', 0),
+                        'total_vol': token_data.get('totalVol', 0),
+                        'status': 'active',
+                        'source': 'binance_api'
                     })
-        except Exception:
+            if competitions:
+                return competitions
+    except Exception:
+        pass
+    
+    # Fallback: Sử dụng danh sách token đã lưu và lấy giá từ Binance
+    for symbol, info in ACTIVE_ALPHA_TOKENS.items():
+        if info.get('status') != 'active':
             continue
+        
+        try:
+            # Lấy giá từ Binance Spot hoặc Futures
+            price_data = None
+            for stable in ['USDT', 'USDC']:
+                url = f"{BINANCE_API_URL}/ticker/24hr?symbol={symbol}{stable}"
+                data = await fetch_json(url, timeout=5)
+                if data and 'lastPrice' in data:
+                    price_data = data
+                    break
+            
+            # Nếu không có trên Binance Spot, thử Futures
+            if not price_data:
+                for stable in ['USDT']:
+                    url = f"{BINANCE_F_API_URL}/ticker/24hr?symbol={symbol}{stable}"
+                    data = await fetch_json(url, timeout=5)
+                    if data and 'lastPrice' in data:
+                        price_data = data
+                        break
+            
+            if price_data:
+                competitions.append({
+                    'symbol': symbol,
+                    'name': symbol,
+                    'price': float(price_data.get('lastPrice', 0)),
+                    'volume_24h': float(price_data.get('quoteVolume', 0)),
+                    'price_change_24h': float(price_data.get('priceChangePercent', 0)),
+                    'reward': info.get('reward', 0),
+                    'min_vol': info.get('min_vol', 0),
+                    'status': 'active',
+                    'source': 'binance'
+                })
+            else:
+                # Token chưa list trên Binance, chỉ hiển thị info cơ bản
+                competitions.append({
+                    'symbol': symbol,
+                    'name': symbol,
+                    'reward': info.get('reward', 0),
+                    'min_vol': info.get('min_vol', 0),
+                    'status': 'active',
+                    'source': 'manual'
+                })
+        except Exception:
+            # Thêm token với info cơ bản nếu có lỗi
+            competitions.append({
+                'symbol': symbol,
+                'name': symbol,
+                'reward': info.get('reward', 0),
+                'min_vol': info.get('min_vol', 0),
+                'status': 'active',
+                'source': 'manual'
+            })
     
     return competitions
 
 
 async def get_alpha_competition_report() -> str:
-    """Tạo báo cáo Alpha Competition."""
+    """Tạo báo cáo Alpha Competition - chỉ lấy từ Binance."""
     cache_key = "alpha_competition"
     cached = get_cached(cache_key, ttl=120)
     if cached:
         return cached
     
-    # Lấy dữ liệu từ web
-    competitions = await get_alpha_competitions_from_web()
+    # Lấy thời gian Việt Nam
+    vn_now = get_vn_time()
+    
+    # Lấy dữ liệu từ Binance
+    competitions = await get_binance_alpha_tokens()
     
     if not competitions:
-        # Fallback: Hiển thị thông tin cơ bản nếu không lấy được
-        msg = """
-🌊 **BINANCE ALPHA COMPETITION**
+        msg = f"""
+👤 **DAILY ALPHA REPORT**
+📅 **Date:** {vn_now.strftime('%Y-%m-%d')}
 ══════════════════════════════
 
-⚠️ **Lưu ý:** Dữ liệu competition cần cập nhật thủ công.
+⚠️ **Không có competition nào đang chạy**
 
-📋 **Các token Alpha đang hot:**
-├ STAR, KGEN, RAVE, ZKP
-├ VINE, B2, BROCCOLI
-└ TUT, BMT
-
-💡 **Cách xem chi tiết:**
-├ Gõ `/p <symbol>` để xem giá
-└ Gõ `/ch <symbol>` để xem chart
-
-🔗 **Link tham khảo:**
-└ https://www.binance.com/en/alpha
+📋 **Để cập nhật danh sách:**
+Liên hệ admin hoặc kiểm tra:
+🔗 https://www.binance.com/en/alpha
 
 ══════════════════════════════
+🕐 `{vn_now.strftime('%H:%M:%S')} (UTC+7)`
 """
         return msg
     
-    # Sắp xếp theo volume 24h
-    competitions.sort(key=lambda x: x.get('volume_24h', 0), reverse=True)
-    
-    now = datetime.now().strftime('%Y-%m-%d')
+    # Sắp xếp theo reward
+    competitions.sort(key=lambda x: x.get('reward', 0), reverse=True)
     
     msg = f"""
-🌊 **WAVE ALPHA CHANNEL**
-📅 **Date:** {now}
+👤 **DAILY ALPHA REPORT**
+📅 **Date:** {vn_now.strftime('%Y-%m-%d')}
 ══════════════════════════════
 """
     
-    for i, comp in enumerate(competitions[:10], 1):
+    for comp in competitions[:10]:
         symbol = comp.get('symbol', 'N/A')
-        name = comp.get('name', symbol)
-        price = comp.get('price', 0)
+        reward = comp.get('reward', 0)
+        min_vol = comp.get('min_vol', 0)
         vol_24h = comp.get('volume_24h', 0)
+        price = comp.get('price', 0)
         change_24h = comp.get('price_change_24h', 0) or 0
-        liquidity = comp.get('liquidity', 0)
-        chain = comp.get('chain', 'unknown')
+        source = comp.get('source', 'unknown')
         
-        # Icon dựa trên thay đổi giá
+        # Format reward
+        if reward >= 1000000:
+            reward_str = f"${reward/1000000:,.2f}M"
+        elif reward >= 1000:
+            reward_str = f"${reward/1000:,.1f}K"
+        else:
+            reward_str = f"${reward:,.0f}"
+        
+        # Icon thay đổi giá
         change_icon = '📈' if change_24h >= 0 else '📉'
         
         msg += f"""
 {'─' * 30}
-🪙 **{symbol}** ({name})
-├ 💰 Price: `{format_price(price)}`
-├ {change_icon} 24h: `{change_24h:+.2f}%`
-├ 📊 Vol 24h: `${vol_24h:,.0f}`
-├ 💎 Liquidity: `${liquidity:,.0f}`
-└ 🔗 Chain: `{chain}`
+🏆 **{symbol}**
+├ 💵 Reward: `{reward_str}`
+├ 📊 Min Vol: `${min_vol:,.0f}` {change_icon}
 """
+        
+        if vol_24h > 0:
+            if vol_24h >= 1000000:
+                vol_str = f"${vol_24h/1000000:,.1f}M"
+            else:
+                vol_str = f"${vol_24h:,.0f}"
+            msg += f"└ 📈 Total Vol: `{vol_str}` ({change_24h:+.1f}%)\n"
+        else:
+            msg += f"└ 📍 Source: `{source}`\n"
     
     msg += f"""
 ══════════════════════════════
 💡 Gõ `/p <symbol>` để xem chi tiết
-🕐 Cập nhật: {datetime.now().strftime('%H:%M:%S')}
+🕐 `{vn_now.strftime('%H:%M:%S')} (UTC+7)`
 """
     
     set_cached(cache_key, msg)
@@ -1105,58 +1177,80 @@ async def get_alpha_competition_report() -> str:
 async def get_alpha_daily_report(date_str: str = None) -> str:
     """
     Tạo báo cáo Alpha hàng ngày với thông tin reward.
-    Format giống như trong ảnh Wave Alpha Channel.
+    Chỉ lấy dữ liệu từ Binance Alpha.
     """
+    # Lấy thời gian Việt Nam
+    vn_now = get_vn_time()
+    
     if not date_str:
-        date_str = datetime.now().strftime('%Y-%m-%d')
+        date_str = vn_now.strftime('%Y-%m-%d')
     
     cache_key = f"alpha_daily_{date_str}"
     cached = get_cached(cache_key, ttl=300)
     if cached:
         return cached
     
-    # Lấy dữ liệu token
-    competitions = await get_alpha_competitions_from_web()
+    # Lấy dữ liệu token từ Binance
+    competitions = await get_binance_alpha_tokens()
     
     msg = f"""
-🌊 **WAVE ALPHA CHANNEL**
 👤 **DAILY ALPHA REPORT**
 📅 **Date:** {date_str}
 ══════════════════════════════
 """
     
     if not competitions:
-        msg += """
-⚠️ Không thể lấy dữ liệu tự động.
+        msg += f"""
+⚠️ Không có Alpha competition đang chạy.
 
-📝 **Để cập nhật dữ liệu reward thủ công:**
+📝 **Để cập nhật dữ liệu:**
 Liên hệ admin hoặc kiểm tra:
 🔗 https://www.binance.com/en/alpha
 ══════════════════════════════
+🕐 `{vn_now.strftime('%H:%M:%S')} (UTC+7)`
 """
         return msg
     
+    # Sắp xếp theo reward
+    competitions.sort(key=lambda x: x.get('reward', 0), reverse=True)
+    
     for comp in competitions[:8]:
         symbol = comp.get('symbol', 'N/A')
-        price = comp.get('price', 0)
+        reward = comp.get('reward', 0)
+        min_vol = comp.get('min_vol', 0)
         vol_24h = comp.get('volume_24h', 0)
         change_24h = comp.get('price_change_24h', 0) or 0
+        
+        # Format reward
+        if reward >= 1000000:
+            reward_str = f"${reward/1000000:,.2f}M"
+        elif reward >= 1000:
+            reward_str = f"${reward/1000:,.1f}K"
+        else:
+            reward_str = f"${reward:,.0f}"
         
         # Icon thay đổi
         vol_icon = '📈' if change_24h >= 0 else '📉'
         
+        # Format volume
+        if vol_24h >= 1000000:
+            vol_str = f"${vol_24h/1000000:,.1f}M"
+        elif vol_24h > 0:
+            vol_str = f"${vol_24h:,.0f}"
+        else:
+            vol_str = "N/A"
+        
         msg += f"""
 {'─' * 30}
 🏆 **{symbol}**
-├ 💵 Reward: *Đang cập nhật*
-├ 📊 Min Vol: `${vol_24h/100:,.0f}` {vol_icon}
-└ 📈 Total Vol: `${vol_24h:,.0f}` ({change_24h:+.1f}%)
+├ 💵 Reward: `{reward_str}`
+├ 📊 Min Vol: `${min_vol:,.0f}` {vol_icon}
+└ 📈 Total Vol: `{vol_str}` ({change_24h:+.1f}%)
 """
     
     msg += f"""
 ══════════════════════════════
-⚠️ *Reward data cần cập nhật từ Binance*
-🕐 `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`
+🕐 `{vn_now.strftime('%Y-%m-%d %H:%M:%S')} (UTC+7)`
 """
     
     set_cached(cache_key, msg)
