@@ -978,12 +978,44 @@ VN_TIMEZONE = timezone(timedelta(hours=7))
 BINANCE_ALPHA_API = "https://www.binance.com/bapi/alpha/v1"
 
 # Danh sách token Alpha đang active trên Binance (cập nhật thủ công)
-# Format: symbol -> {reward, min_vol, end_date}
+# Format: symbol -> {reward_usd, reward_tokens, min_vol, total_vol, status}
+# reward_usd: Giá trị USD của reward
+# reward_tokens: Số lượng token reward
+# min_vol: Volume tối thiểu để đủ điều kiện
+# total_vol: Tổng volume hiện tại của competition
 ACTIVE_ALPHA_TOKENS = {
-    'STAR': {'reward': 26, 'min_vol': 0, 'status': 'active'},
-    'KGEN': {'reward': 51, 'min_vol': 98882, 'status': 'active'},
-    'RAVE': {'reward': 26, 'min_vol': 1526, 'status': 'active'},
-    'ZKP': {'reward': 114486125, 'min_vol': 489, 'status': 'active'},
+    'STAR': {
+        'reward_usd': 26,
+        'reward_tokens': 0,  # Số lượng token reward
+        'min_vol': 0,
+        'total_vol': 9800000,  # $9.8M
+        'vol_change': 6300000,  # +$6.3M
+        'status': 'active'
+    },
+    'KGEN': {
+        'reward_usd': 51,
+        'reward_tokens': 0,
+        'min_vol': 98882,
+        'total_vol': 552900000,  # $552.9M
+        'vol_change': 59400000,  # +$59.4M
+        'status': 'active'
+    },
+    'RAVE': {
+        'reward_usd': 26,
+        'reward_tokens': 0,
+        'min_vol': 1526,
+        'total_vol': 43400000,  # $43.4M
+        'vol_change': -9600000,  # -$9.6M
+        'status': 'active'
+    },
+    'ZKP': {
+        'reward_usd': 114486125,
+        'reward_tokens': 114486125,  # Số token ZKP
+        'min_vol': 489,
+        'total_vol': 39400000,  # $39.4M
+        'vol_change': -6300000,  # -$6.3M
+        'status': 'active'
+    },
 }
 
 
@@ -1037,11 +1069,13 @@ async def get_binance_alpha_tokens() -> list:
         try:
             # Lấy giá từ Binance Spot hoặc Futures
             price_data = None
+            trading_pair = None
             for stable in ['USDT', 'USDC']:
                 url = f"{BINANCE_API_URL}/ticker/24hr?symbol={symbol}{stable}"
                 data = await fetch_json(url, timeout=5)
                 if data and 'lastPrice' in data:
                     price_data = data
+                    trading_pair = f"{symbol}/{stable}"
                     break
             
             # Nếu không có trên Binance Spot, thử Futures
@@ -1051,17 +1085,32 @@ async def get_binance_alpha_tokens() -> list:
                     data = await fetch_json(url, timeout=5)
                     if data and 'lastPrice' in data:
                         price_data = data
+                        trading_pair = f"{symbol}/{stable} (Futures)"
                         break
             
             if price_data:
+                price = float(price_data.get('lastPrice', 0))
+                reward_usd = info.get('reward_usd', 0)
+                reward_tokens = info.get('reward_tokens', 0)
+                
+                # Nếu chưa có reward_tokens, tính từ reward_usd / price
+                if reward_tokens == 0 and price > 0 and reward_usd > 0:
+                    reward_tokens = reward_usd / price
+                
                 competitions.append({
                     'symbol': symbol,
                     'name': symbol,
-                    'price': float(price_data.get('lastPrice', 0)),
+                    'price': price,
                     'volume_24h': float(price_data.get('quoteVolume', 0)),
                     'price_change_24h': float(price_data.get('priceChangePercent', 0)),
-                    'reward': info.get('reward', 0),
+                    'high_24h': float(price_data.get('highPrice', 0)),
+                    'low_24h': float(price_data.get('lowPrice', 0)),
+                    'reward_usd': reward_usd,
+                    'reward_tokens': reward_tokens,
                     'min_vol': info.get('min_vol', 0),
+                    'total_vol': info.get('total_vol', 0),
+                    'vol_change': info.get('vol_change', 0),
+                    'trading_pair': trading_pair,
                     'status': 'active',
                     'source': 'binance'
                 })
@@ -1070,8 +1119,12 @@ async def get_binance_alpha_tokens() -> list:
                 competitions.append({
                     'symbol': symbol,
                     'name': symbol,
-                    'reward': info.get('reward', 0),
+                    'price': 0,
+                    'reward_usd': info.get('reward_usd', 0),
+                    'reward_tokens': info.get('reward_tokens', 0),
                     'min_vol': info.get('min_vol', 0),
+                    'total_vol': info.get('total_vol', 0),
+                    'vol_change': info.get('vol_change', 0),
                     'status': 'active',
                     'source': 'manual'
                 })
@@ -1080,13 +1133,43 @@ async def get_binance_alpha_tokens() -> list:
             competitions.append({
                 'symbol': symbol,
                 'name': symbol,
-                'reward': info.get('reward', 0),
+                'price': 0,
+                'reward_usd': info.get('reward_usd', 0),
+                'reward_tokens': info.get('reward_tokens', 0),
                 'min_vol': info.get('min_vol', 0),
+                'total_vol': info.get('total_vol', 0),
+                'vol_change': info.get('vol_change', 0),
                 'status': 'active',
                 'source': 'manual'
             })
     
     return competitions
+
+
+def format_number(value: float, symbol: str = "$") -> str:
+    """Format số lớn thành dạng đọc được (K, M, B)."""
+    if value >= 1000000000:
+        return f"{symbol}{value/1000000000:,.2f}B"
+    elif value >= 1000000:
+        return f"{symbol}{value/1000000:,.1f}M"
+    elif value >= 1000:
+        return f"{symbol}{value/1000:,.1f}K"
+    else:
+        return f"{symbol}{value:,.0f}"
+
+
+def format_token_amount(amount: float) -> str:
+    """Format số lượng token."""
+    if amount >= 1000000000:
+        return f"{amount/1000000000:,.2f}B"
+    elif amount >= 1000000:
+        return f"{amount/1000000:,.2f}M"
+    elif amount >= 1000:
+        return f"{amount/1000:,.1f}K"
+    elif amount >= 1:
+        return f"{amount:,.2f}"
+    else:
+        return f"{amount:,.6f}"
 
 
 async def get_alpha_competition_report() -> str:
@@ -1119,8 +1202,8 @@ Liên hệ admin hoặc kiểm tra:
 """
         return msg
     
-    # Sắp xếp theo reward
-    competitions.sort(key=lambda x: x.get('reward', 0), reverse=True)
+    # Sắp xếp theo reward_usd
+    competitions.sort(key=lambda x: x.get('reward_usd', 0), reverse=True)
     
     msg = f"""
 👤 **DAILY ALPHA REPORT**
@@ -1130,39 +1213,35 @@ Liên hệ admin hoặc kiểm tra:
     
     for comp in competitions[:10]:
         symbol = comp.get('symbol', 'N/A')
-        reward = comp.get('reward', 0)
-        min_vol = comp.get('min_vol', 0)
-        vol_24h = comp.get('volume_24h', 0)
         price = comp.get('price', 0)
-        change_24h = comp.get('price_change_24h', 0) or 0
-        source = comp.get('source', 'unknown')
-        
-        # Format reward
-        if reward >= 1000000:
-            reward_str = f"${reward/1000000:,.2f}M"
-        elif reward >= 1000:
-            reward_str = f"${reward/1000:,.1f}K"
-        else:
-            reward_str = f"${reward:,.0f}"
+        reward_usd = comp.get('reward_usd', 0)
+        reward_tokens = comp.get('reward_tokens', 0)
+        min_vol = comp.get('min_vol', 0)
+        total_vol = comp.get('total_vol', 0)
+        vol_change = comp.get('vol_change', 0)
+        price_change_24h = comp.get('price_change_24h', 0) or 0
         
         # Icon thay đổi giá
-        change_icon = '📈' if change_24h >= 0 else '📉'
+        price_icon = '📈' if price_change_24h >= 0 else '📉'
+        vol_icon = '📈' if vol_change >= 0 else '📉'
+        
+        # Format các giá trị
+        price_str = format_price(price) if price > 0 else 'N/A'
+        reward_usd_str = format_number(reward_usd, "$")
+        reward_tokens_str = format_token_amount(reward_tokens) if reward_tokens > 0 else 'N/A'
+        min_vol_str = format_number(min_vol, "$")
+        total_vol_str = format_number(total_vol, "$") if total_vol > 0 else 'N/A'
+        vol_change_str = format_number(abs(vol_change), "+$" if vol_change >= 0 else "-$")
         
         msg += f"""
 {'─' * 30}
 🏆 **{symbol}**
-├ 💵 Reward: `{reward_str}`
-├ 📊 Min Vol: `${min_vol:,.0f}` {change_icon}
+├ 💰 Giá: `{price_str}` {price_icon} ({price_change_24h:+.1f}%)
+├ 💵 Reward: `{reward_usd_str}`
+├ 🪙 Token Reward: `{reward_tokens_str} {symbol}`
+├ 📊 Min Vol: `{min_vol_str}` {vol_icon}
+└ 📈 Total Vol: `{total_vol_str}` ({vol_change_str})
 """
-        
-        if vol_24h > 0:
-            if vol_24h >= 1000000:
-                vol_str = f"${vol_24h/1000000:,.1f}M"
-            else:
-                vol_str = f"${vol_24h:,.0f}"
-            msg += f"└ 📈 Total Vol: `{vol_str}` ({change_24h:+.1f}%)\n"
-        else:
-            msg += f"└ 📍 Source: `{source}`\n"
     
     msg += f"""
 ══════════════════════════════
@@ -1211,41 +1290,39 @@ Liên hệ admin hoặc kiểm tra:
 """
         return msg
     
-    # Sắp xếp theo reward
-    competitions.sort(key=lambda x: x.get('reward', 0), reverse=True)
+    # Sắp xếp theo reward_usd
+    competitions.sort(key=lambda x: x.get('reward_usd', 0), reverse=True)
     
     for comp in competitions[:8]:
         symbol = comp.get('symbol', 'N/A')
-        reward = comp.get('reward', 0)
+        price = comp.get('price', 0)
+        reward_usd = comp.get('reward_usd', 0)
+        reward_tokens = comp.get('reward_tokens', 0)
         min_vol = comp.get('min_vol', 0)
-        vol_24h = comp.get('volume_24h', 0)
-        change_24h = comp.get('price_change_24h', 0) or 0
-        
-        # Format reward
-        if reward >= 1000000:
-            reward_str = f"${reward/1000000:,.2f}M"
-        elif reward >= 1000:
-            reward_str = f"${reward/1000:,.1f}K"
-        else:
-            reward_str = f"${reward:,.0f}"
+        total_vol = comp.get('total_vol', 0)
+        vol_change = comp.get('vol_change', 0)
+        price_change_24h = comp.get('price_change_24h', 0) or 0
         
         # Icon thay đổi
-        vol_icon = '📈' if change_24h >= 0 else '📉'
+        price_icon = '📈' if price_change_24h >= 0 else '📉'
+        vol_icon = '📈' if vol_change >= 0 else '📉'
         
-        # Format volume
-        if vol_24h >= 1000000:
-            vol_str = f"${vol_24h/1000000:,.1f}M"
-        elif vol_24h > 0:
-            vol_str = f"${vol_24h:,.0f}"
-        else:
-            vol_str = "N/A"
+        # Format các giá trị
+        price_str = format_price(price) if price > 0 else 'N/A'
+        reward_usd_str = format_number(reward_usd, "$")
+        reward_tokens_str = format_token_amount(reward_tokens) if reward_tokens > 0 else 'N/A'
+        min_vol_str = format_number(min_vol, "$")
+        total_vol_str = format_number(total_vol, "$") if total_vol > 0 else 'N/A'
+        vol_change_str = format_number(abs(vol_change), "+$" if vol_change >= 0 else "-$")
         
         msg += f"""
 {'─' * 30}
 🏆 **{symbol}**
-├ 💵 Reward: `{reward_str}`
-├ 📊 Min Vol: `${min_vol:,.0f}` {vol_icon}
-└ 📈 Total Vol: `{vol_str}` ({change_24h:+.1f}%)
+├ 💰 Giá: `{price_str}` {price_icon} ({price_change_24h:+.1f}%)
+├ 💵 Reward: `{reward_usd_str}`
+├ 🪙 Token Reward: `{reward_tokens_str} {symbol}`
+├ 📊 Min Vol: `{min_vol_str}` {vol_icon}
+└ 📈 Total Vol: `{total_vol_str}` ({vol_change_str})
 """
     
     msg += f"""
