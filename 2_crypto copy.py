@@ -1,6 +1,19 @@
-﻿import sys
-import requests
+﻿"""
+================================================================================
+CRYPTO TELEGRAM BOT - Professional Cryptocurrency Price & Chart Bot
+================================================================================
+Version: 3.0 (Merged & Optimized)
+Description: A high-performance Telegram bot for real-time cryptocurrency 
+             price tracking, candlestick charts, and market analysis.
+================================================================================
+"""
+
+# ==============================================================================
+# IMPORTS
+# ==============================================================================
+import sys
 import asyncio
+import aiohttp
 import io
 import re
 import os
@@ -9,535 +22,1318 @@ import mplfinance as mpf
 import ccxt.async_support as ccxt
 from datetime import datetime
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, MessageHandler, filters
 from telegram.constants import ParseMode
 from dotenv import load_dotenv
 
-# --- CONFIG ---
+# ==============================================================================
+# CONFIGURATION & INITIALIZATION
+# ==============================================================================
+
+# UTF-8 Encoding Setup
 try:
     if sys.stdout.encoding != 'utf-8':
         sys.stdout.reconfigure(encoding='utf-8')
         sys.stderr.reconfigure(encoding='utf-8')
-except: pass
-
-load_dotenv()
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
-if not BOT_TOKEN:
-    # Fallback
+except Exception:
     pass
 
+# Load Environment Variables
+load_dotenv()
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
+
 if not BOT_TOKEN:
-    print("LỖI: Thiếu BOT_TOKEN.")
+    print("ERROR: Missing BOT_TOKEN.")
     sys.exit(1)
 
+# ==============================================================================
+# API ENDPOINTS
+# ==============================================================================
 BINANCE_API_URL = "https://api.binance.com/api/v3"
 BINANCE_F_API_URL = "https://fapi.binance.com/fapi/v1"
 COINGECKO_API_URL = "https://api.coingecko.com/api/v3"
 DEXSCREENER_API_URL = "https://api.dexscreener.com/latest/dex"
-SUPPORTED_EXCHANGES = ['binance', 'kucoin', 'gateio', 'mexc', 'okx', 'bingx', 'bitget', 'coinbase', 'kraken', 'bitfinex', 'huobi', 'bitstamp', 'cex']
+
+# ==============================================================================
+# CONSTANTS
+# ==============================================================================
+PRIORITY_EXCHANGES = ['binance', 'bybit', 'okx', 'gateio', 'mexc', 'kucoin']
 VALID_SYMBOL_PATTERN = re.compile(r'^[a-zA-Z0-9]{1,10}$')
+STABLES = ['USDT', 'USDC', 'FDUSD', 'USD']
 
-# --- HELPER FUNCTIONS ---
-def is_contract_address(address: str) -> bool:
-    return address.startswith('0x') and len(address) == 42
+# ==============================================================================
+# SIMPLE CACHING (without cachetools dependency)
+# ==============================================================================
+_cache = {}
+_cache_times = {}
 
-def format_price(price: float) -> str:
-    if price is None: return "N/A"
-    if abs(price) >= 10: return f"${price:,.2f}"
-    if abs(price) >= 1: return f"${price:,.3f}"
-    if abs(price) >= 0.001: return f"${price:,.4f}"
-    return f"${price:,.8f}"
 
-def safe_eval(expression: str) -> float | None:
-    if not re.match(r'^[0-9\s\+\-\*\/\(\)\.]+$', expression): return None
-    try: return eval(expression, {"__builtins__": {}}, {})
-    except: return None
-
-# --- DATA FETCHING ---
-
-def get_coingecko_id(symbol: str) -> str | None:
-    try:
-        d = requests.get(f"{COINGECKO_API_URL}/search?query={symbol}", timeout=10).json()
-        for c in d.get('coins', []):
-            if c.get('symbol', '').lower() == symbol.lower(): return c.get('id')
-    except: pass
+def get_cached(key: str, ttl: int = 60):
+    """Get cached value if not expired."""
+    if key in _cache and key in _cache_times:
+        if (datetime.now() - _cache_times[key]).total_seconds() < ttl:
+            return _cache[key]
     return None
 
-def get_coingecko_info(symbol: str):
-    """Lấy thông tin bổ sung (ATH, Market Cap...) từ CoinGecko"""
-    cid = get_coingecko_id(symbol)
-    if not cid: return None
-    try:
-        d = requests.get(f"{COINGECKO_API_URL}/coins/{cid}", timeout=10).json()
-        md = d.get('market_data', {})
-        return {
-            'ath': md.get('ath', {}).get('usd', 0),
-            'ath_change': md.get('ath_change_percentage', {}).get('usd', 0),
-            'ath_date': md.get('ath_date', {}).get('usd', '').split('T')[0],
-            'cap': md.get('market_cap', {}).get('usd', 0),
-            'circulating': md.get('circulating_supply', 0),
-            'total_supply': md.get('total_supply', 0)
-        }
-    except: return None
 
-def get_binance_kline_change(trading_pair: str, interval: str, is_future=False) -> float | None:
+def set_cached(key: str, value):
+    """Set cached value with current timestamp."""
+    _cache[key] = value
+    _cache_times[key] = datetime.now()
+
+
+# ==============================================================================
+# HTTP SESSION MANAGEMENT
+# ==============================================================================
+_http_session: aiohttp.ClientSession | None = None
+
+
+async def get_http_session() -> aiohttp.ClientSession:
+    """Get or create a singleton HTTP session with connection pooling."""
+    global _http_session
+    
+    if _http_session is None or _http_session.closed:
+        timeout = aiohttp.ClientTimeout(total=10, connect=5)
+        connector = aiohttp.TCPConnector(
+            limit=50,
+            limit_per_host=10,
+            ttl_dns_cache=300
+        )
+        _http_session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+    
+    return _http_session
+
+
+async def close_http_session():
+    """Close the global HTTP session gracefully."""
+    global _http_session
+    if _http_session and not _http_session.closed:
+        await _http_session.close()
+        _http_session = None
+
+
+# ==============================================================================
+# HELPER FUNCTIONS
+# ==============================================================================
+
+def is_contract_address(address: str) -> bool:
+    """Check if a string is a valid EVM contract address."""
+    return address.startswith('0x') and len(address) == 42
+
+
+def format_price(price: float) -> str:
+    """Format a price value with appropriate decimal places."""
+    if price is None:
+        return "N/A"
+    if abs(price) >= 10:
+        return f"${price:,.2f}"
+    if abs(price) >= 1:
+        return f"${price:,.3f}"
+    if abs(price) >= 0.001:
+        return f"${price:,.4f}"
+    return f"${price:,.8f}"
+
+
+def safe_eval(expression: str) -> float | None:
+    """Safely evaluate a mathematical expression string."""
+    if not re.match(r'^[0-9\s\+\-\*\/\(\)\.]+$', expression):
+        return None
+    try:
+        return eval(expression, {"__builtins__": {}}, {})
+    except Exception:
+        return None
+
+
+# ==============================================================================
+# ASYNC DATA FETCHING FUNCTIONS
+# ==============================================================================
+
+async def fetch_json(url: str, timeout: float = 5) -> dict | list | None:
+    """Generic async JSON fetcher with error handling."""
+    try:
+        session = await get_http_session()
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+            if resp.status == 200:
+                return await resp.json()
+    except Exception:
+        pass
+    return None
+
+
+async def get_coingecko_id(symbol: str) -> str | None:
+    """Get CoinGecko coin ID from ticker symbol with caching."""
+    symbol_lower = symbol.lower()
+    
+    cached = get_cached(f"cgid_{symbol_lower}", ttl=3600)
+    if cached:
+        return cached
+    
+    data = await fetch_json(f"{COINGECKO_API_URL}/search?query={symbol}")
+    if data:
+        for c in data.get('coins', []):
+            if c.get('symbol', '').lower() == symbol_lower:
+                cg_id = c.get('id')
+                set_cached(f"cgid_{symbol_lower}", cg_id)
+                return cg_id
+    return None
+
+
+async def get_coingecko_info(symbol: str) -> dict | None:
+    """Get detailed coin information from CoinGecko with caching."""
+    cache_key = f"cg_info_{symbol.lower()}"
+    
+    cached = get_cached(cache_key, ttl=300)
+    if cached:
+        return cached
+    
+    cid = await get_coingecko_id(symbol)
+    if not cid:
+        return None
+    
+    data = await fetch_json(f"{COINGECKO_API_URL}/coins/{cid}", timeout=10)
+    if not data:
+        return None
+    
+    md = data.get('market_data', {})
+    result = {
+        'name': data.get('name', ''),
+        'symbol': data.get('symbol', '').upper(),
+        'rank': data.get('market_cap_rank', 0),
+        'current_price': md.get('current_price', {}).get('usd', 0),
+        'high_24h': md.get('high_24h', {}).get('usd', 0),
+        'low_24h': md.get('low_24h', {}).get('usd', 0),
+        'change_1h': md.get('price_change_percentage_1h_in_currency', {}).get('usd', 0),
+        'change_24h': md.get('price_change_percentage_24h', 0),
+        'change_7d': md.get('price_change_percentage_7d', 0),
+        'change_30d': md.get('price_change_percentage_30d', 0),
+        'ath': md.get('ath', {}).get('usd', 0),
+        'ath_change': md.get('ath_change_percentage', {}).get('usd', 0),
+        'ath_date': md.get('ath_date', {}).get('usd', '').split('T')[0] if md.get('ath_date', {}).get('usd') else '',
+        'atl': md.get('atl', {}).get('usd', 0),
+        'atl_change': md.get('atl_change_percentage', {}).get('usd', 0),
+        'atl_date': md.get('atl_date', {}).get('usd', '').split('T')[0] if md.get('atl_date', {}).get('usd') else '',
+        'cap': md.get('market_cap', {}).get('usd', 0),
+        'volume_24h': md.get('total_volume', {}).get('usd', 0),
+        'fdv': md.get('fully_diluted_valuation', {}).get('usd', 0),
+        'circulating': md.get('circulating_supply', 0),
+        'total_supply': md.get('total_supply', 0),
+        'max_supply': md.get('max_supply', 0),
+    }
+    
+    set_cached(cache_key, result)
+    return result
+
+
+async def get_binance_kline_change(trading_pair: str, interval: str, is_future: bool = False) -> float | None:
+    """Calculate price change percentage from Binance kline data."""
     api_url = BINANCE_F_API_URL if is_future else BINANCE_API_URL
+    url = f"{api_url}/klines?symbol={trading_pair}&interval={interval}&limit=2"
+    
+    data = await fetch_json(url)
+    if not data or len(data) < 2:
+        return None
+    
     try:
-        url = f"{api_url}/klines?symbol={trading_pair}&interval={interval}&limit=2"
-        resp = requests.get(url, timeout=5)
-        if resp.status_code != 200: return None
-        k = resp.json()
-        if len(k) < 2: return None
-        prev_close = float(k[0][4])
-        curr_price = float(k[1][4])
-        if prev_close == 0: return 0.0
+        prev_close = float(data[0][4])
+        curr_price = float(data[1][4])
+        if prev_close == 0:
+            return 0.0
         return ((curr_price - prev_close) / prev_close) * 100
-    except: return None
+    except Exception:
+        return None
 
-# --- MAIN REPORT GENERATION ---
 
-async def get_token_report(symbol: str) -> str:
-    """
-    Tạo báo cáo chi tiết cho token (Dùng cho lệnh /p và $symbol)
-    """
+async def get_binance_price_data(symbol: str) -> tuple[dict | None, str, str]:
+    """Fetch price data from Binance Spot and Futures APIs in parallel."""
     symbol_upper = symbol.upper()
-    stables = ['USDT', 'USDC', 'FDUSD']
     
-    price_data = None
-    source = ""
-    pair_name = ""
-    
-    # 1. Thử Binance Spot & Futures
-    for is_future in [False, True]:
+    async def fetch_binance(is_future: bool, stable: str):
         api_url = BINANCE_F_API_URL if is_future else BINANCE_API_URL
-        src_name = "Binance Futures" if is_future else "Sàn Binance"
+        pair = f"{symbol_upper}{stable}"
+        url = f"{api_url}/ticker/24hr?symbol={pair}"
         
-        for s in stables:
-            pair = f"{symbol_upper}{s}"
-            try:
-                url = f"{api_url}/ticker/24hr?symbol={pair}"
-                loop = asyncio.get_event_loop()
-                resp = await loop.run_in_executor(None, requests.get, url)
-                
-                if resp.status_code == 200:
-                    data = resp.json()
-                    price = float(data['lastPrice'])
-                    p24h = float(data['priceChangePercent'])
-                    p1h = get_binance_kline_change(pair, '1h', is_future)
-                    p5m = get_binance_kline_change(pair, '5m', is_future)
-                    
-                    price_24h = price / (1 + p24h/100) if p24h != -100 else 0
-                    price_1h = price / (1 + p1h/100) if p1h else 0
-                    price_5m = price / (1 + p5m/100) if p5m else 0
-                    
-                    price_data = {
-                        'price': price,
-                        'p5m': p5m, 'price_5m': price_5m,
-                        'p1h': p1h, 'price_1h': price_1h,
-                        'p24h': p24h, 'price_24h': price_24h,
-                        'vol': float(data['quoteVolume']),
-                        'vol_unit': s
-                    }
-                    source = src_name
-                    pair_name = f"{symbol_upper}/{s}"
-                    break 
-            except: continue
-        if price_data: break
+        data = await fetch_json(url)
+        if not data:
+            return None
+        
+        try:
+            price = float(data['lastPrice'])
+            p24h = float(data['priceChangePercent'])
+            
+            kline_tasks = [
+                get_binance_kline_change(pair, '1h', is_future),
+                get_binance_kline_change(pair, '5m', is_future)
+            ]
+            p1h, p5m = await asyncio.gather(*kline_tasks)
+            
+            price_24h = price / (1 + p24h/100) if p24h != -100 else 0
+            price_1h = price / (1 + p1h/100) if p1h else 0
+            price_5m = price / (1 + p5m/100) if p5m else 0
+            
+            return {
+                'price': price,
+                'p5m': p5m, 'price_5m': price_5m,
+                'p1h': p1h, 'price_1h': price_1h,
+                'p24h': p24h, 'price_24h': price_24h,
+                'vol': float(data['quoteVolume']),
+                'vol_unit': stable,
+                'source': "Binance Futures" if is_future else "Sàn Binance",
+                'pair': f"{symbol_upper}/{stable}"
+            }
+        except Exception:
+            return None
+    
+    tasks = []
+    for is_future in [False, True]:
+        for stable in ['USDT', 'USDC', 'FDUSD']:
+            tasks.append(fetch_binance(is_future, stable))
+    
+    results = await asyncio.gather(*tasks)
+    
+    for r in results:
+        if r:
+            return r, r['source'], r['pair']
+    
+    return None, "", ""
 
-    # 2. CCXT Exchanges
-    if not price_data:
-        for ex_id in ['gateio', 'mexc', 'kucoin', 'okx', 'bybit']:
-            try:
-                ex = getattr(ccxt, ex_id)()
-                # Quick check
-                for s in stables:
-                    try:
-                        t = await ex.fetch_ticker(f"{symbol_upper}/{s}")
+
+async def get_ccxt_price(symbol: str) -> tuple[dict | None, str, str]:
+    """Fetch price from CCXT-supported exchanges as fallback."""
+    symbol_upper = symbol.upper()
+    
+    for ex_id in ['gateio', 'mexc', 'kucoin', 'okx', 'bybit']:
+        ex = None
+        try:
+            ex = getattr(ccxt, ex_id)({'timeout': 5000})
+            
+            for stable in STABLES:
+                try:
+                    t = await ex.fetch_ticker(f"{symbol_upper}/{stable}")
+                    if t and t.get('last'):
                         price = t['last']
-                        price_data = {
+                        p24h = t.get('percentage', 0)
+                        result = {
                             'price': price,
-                            'p24h': t.get('percentage', 0),
-                            'price_24h': price / (1 + t.get('percentage', 0)/100) if t.get('percentage') else 0,
+                            'p24h': p24h,
+                            'price_24h': price / (1 + p24h/100) if p24h else 0,
                             'vol': t.get('quoteVolume', 0),
                             'vol_unit': 'USDT'
                         }
-                        source = f"Sàn {ex.name}"
-                        pair_name = t['symbol']
                         await ex.close()
-                        break
-                    except: continue
-                if price_data: 
+                        return result, f"Sàn {ex.name}", t['symbol']
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        finally:
+            if ex:
+                try:
                     await ex.close()
-                    break
-                await ex.close()
-            except: pass
+                except Exception:
+                    pass
+    
+    return None, "", ""
 
-    # 3. DexScreener
+
+async def get_dexscreener_price(symbol: str) -> tuple[dict | None, str, str]:
+    """Fetch price from DexScreener for DEX-traded tokens."""
+    url = f"{DEXSCREENER_API_URL}/search?q={symbol}"
+    data = await fetch_json(url)
+    
+    if not data or not data.get('pairs'):
+        return None, "", ""
+    
+    p = max(data['pairs'], key=lambda x: x.get('liquidity', {}).get('usd', 0))
+    
+    try:
+        price = float(p['priceUsd'])
+        price_data = {
+            'price': price,
+            'p5m': p.get('priceChange', {}).get('m5'),
+            'p1h': p.get('priceChange', {}).get('h1'),
+            'p24h': p.get('priceChange', {}).get('h24'),
+            'vol': p.get('volume', {}).get('h24', 0),
+            'vol_unit': 'USD'
+        }
+        
+        if price_data['p5m']:
+            price_data['price_5m'] = price / (1 + price_data['p5m']/100)
+        if price_data['p1h']:
+            price_data['price_1h'] = price / (1 + price_data['p1h']/100)
+        if price_data['p24h']:
+            price_data['price_24h'] = price / (1 + price_data['p24h']/100)
+        
+        source = f"DexScreener ({p.get('dexId')})"
+        pair_name = f"{p['baseToken']['symbol']}/{p['quoteToken']['symbol']}"
+        return price_data, source, pair_name
+    except Exception:
+        return None, "", ""
+
+
+# ==============================================================================
+# PRICE PREDICTION
+# ==============================================================================
+
+def calculate_price_prediction(price_data: dict, cg_info: dict | None) -> dict | None:
+    """Calculate price prediction based on technical indicators."""
+    current_price = price_data.get('price', 0)
+    if current_price <= 0:
+        return None
+    
+    signals = {'bullish': 0, 'bearish': 0, 'neutral': 0}
+    
+    p5m = price_data.get('p5m', 0) or 0
+    p1h = price_data.get('p1h', 0) or 0
+    p24h = price_data.get('p24h', 0) or 0
+    
+    # 5-minute trend
+    if p5m > 0.5:
+        signals['bullish'] += 1
+    elif p5m < -0.5:
+        signals['bearish'] += 1
+    else:
+        signals['neutral'] += 1
+    
+    # 1-hour trend
+    if p1h > 1:
+        signals['bullish'] += 2
+    elif p1h < -1:
+        signals['bearish'] += 2
+    else:
+        signals['neutral'] += 1
+    
+    # 24-hour trend
+    if p24h > 3:
+        signals['bullish'] += 3
+    elif p24h < -3:
+        signals['bearish'] += 3
+    elif p24h > 0:
+        signals['bullish'] += 1
+    elif p24h < 0:
+        signals['bearish'] += 1
+    
+    # ATH/ATL analysis
+    if cg_info:
+        ath_change = cg_info.get('ath_change', 0) or 0
+        
+        if ath_change < -80:
+            signals['bullish'] += 3
+        elif ath_change < -50:
+            signals['bullish'] += 2
+        
+        if ath_change > -10:
+            signals['bearish'] += 2
+        
+        change_7d = cg_info.get('change_7d', 0) or 0
+        change_30d = cg_info.get('change_30d', 0) or 0
+        
+        if change_7d > 10:
+            signals['bullish'] += 2
+        elif change_7d < -10:
+            signals['bearish'] += 2
+        
+        if change_30d > 20:
+            signals['bullish'] += 1
+        elif change_30d < -20:
+            signals['bearish'] += 1
+    
+    # Calculate prediction
+    total_signals = signals['bullish'] + signals['bearish'] + signals['neutral']
+    if total_signals == 0:
+        total_signals = 1
+    
+    bullish_score = signals['bullish'] / total_signals * 100
+    bearish_score = signals['bearish'] / total_signals * 100
+    
+    if bullish_score > bearish_score + 15:
+        trend = 'BULLISH'
+        trend_icon = '🟢'
+        confidence = min(bullish_score, 85)
+    elif bearish_score > bullish_score + 15:
+        trend = 'BEARISH'
+        trend_icon = '🔴'
+        confidence = min(bearish_score, 85)
+    else:
+        trend = 'NEUTRAL'
+        trend_icon = '🟡'
+        confidence = 50
+    
+    volatility = abs(p24h) if p24h else 5
+    volatility = max(volatility, 2)
+    volatility = min(volatility, 30)
+    
+    if trend == 'BULLISH':
+        target_pct_high = volatility * 1.5
+        target_pct_low = volatility * 0.3
+    elif trend == 'BEARISH':
+        target_pct_high = volatility * 0.3
+        target_pct_low = volatility * 1.5
+    else:
+        target_pct_high = volatility * 0.8
+        target_pct_low = volatility * 0.8
+    
+    target_price_high = current_price * (1 + target_pct_high / 100)
+    target_price_low = current_price * (1 - target_pct_low / 100)
+    
+    if trend == 'BULLISH' and confidence > 60:
+        recommendation = '📈 Xu hướng LONG'
+    elif trend == 'BEARISH' and confidence > 60:
+        recommendation = '📉 Xu hướng SHORT'
+    else:
+        recommendation = '⏳ Chờ tín hiệu rõ hơn'
+    
+    return {
+        'trend': trend,
+        'trend_icon': trend_icon,
+        'confidence': confidence,
+        'bullish_score': bullish_score,
+        'bearish_score': bearish_score,
+        'target_high': target_price_high,
+        'target_low': target_price_low,
+        'target_pct_high': target_pct_high,
+        'target_pct_low': target_pct_low,
+        'recommendation': recommendation,
+    }
+
+
+# ==============================================================================
+# MAIN REPORT GENERATION
+# ==============================================================================
+
+async def get_token_report(symbol: str) -> str:
+    """Generate a comprehensive price report for a cryptocurrency."""
+    symbol_upper = symbol.upper()
+    
+    cache_key = f"report_{symbol_upper}"
+    cached = get_cached(cache_key, ttl=10)
+    if cached:
+        return cached
+    
+    # Try Binance first
+    price_data, source, pair_name = await get_binance_price_data(symbol)
+    
+    # Try CCXT exchanges
     if not price_data:
-        try:
-            url = f"{DEXSCREENER_API_URL}/search?q={symbol}"
-            d = requests.get(url, timeout=5).json()
-            if d.get('pairs'):
-                p = max(d['pairs'], key=lambda x: x.get('liquidity', {}).get('usd', 0))
-                price = float(p['priceUsd'])
-                price_data = {
-                    'price': price,
-                    'p5m': p.get('priceChange', {}).get('m5'),
-                    'p1h': p.get('priceChange', {}).get('h1'),
-                    'p24h': p.get('priceChange', {}).get('h24'),
-                    'vol': p.get('volume', {}).get('h24', 0),
-                    'vol_unit': 'USD'
-                }
-                # Calc past prices
-                if price_data['p5m']: price_data['price_5m'] = price / (1 + price_data['p5m']/100)
-                if price_data['p1h']: price_data['price_1h'] = price / (1 + price_data['p1h']/100)
-                if price_data['p24h']: price_data['price_24h'] = price / (1 + price_data['p24h']/100)
-                
-                source = f"DexScreener ({p.get('dexId')})"
-                pair_name = f"{p['baseToken']['symbol']}/{p['quoteToken']['symbol']}"
-        except: pass
-
+        price_data, source, pair_name = await get_ccxt_price(symbol)
+    
+    # Try DexScreener
+    if not price_data:
+        price_data, source, pair_name = await get_dexscreener_price(symbol)
+    
     if not price_data:
         return f"😕 Không tìm thấy thông tin cho **{symbol_upper}**."
-
-    cg_info = get_coingecko_info(symbol)
     
-    # --- FORMAT OUTPUT (UPDATED) ---
-    msg = f"🪙 {pair_name} ({source})\n"
-    msg += "--------------------\n"
-    msg += f"Giá: {format_price(price_data['price'])}\n"
-    msg += "--------------------\n"
-    msg += "Biến động (giá quá khứ):\n"
+    # Fetch CoinGecko info
+    cg_info = await get_coingecko_info(symbol)
+    
+    # Format output
+    msg = f"🪙 **{pair_name}**\n"
+    msg += f"📍 Nguồn: `{source}`\n"
+    msg += "══════════════════════\n"
+    msg += f"💰 **Giá hiện tại:** `{format_price(price_data['price'])}`\n"
+    msg += "══════════════════════\n"
+    msg += "📊 **BIẾN ĐỘNG GIÁ**\n"
     
     if price_data.get('p5m') is not None:
-        icon = '📈' if price_data['p5m'] >= 0 else '📉'
+        icon = '🟢' if price_data['p5m'] >= 0 else '🔴'
         val_5m = format_price(price_data.get('price_5m', 0)) if price_data.get('price_5m') else 'N/A'
-        msg += f"- 5 phút:  {icon} {price_data['p5m']:+.2f}% ({val_5m})\n"
+        msg += f"├ 5 phút:  {icon} `{price_data['p5m']:+.2f}%` ({val_5m})\n"
     
     if price_data.get('p1h') is not None:
-        icon = '📈' if price_data['p1h'] >= 0 else '📉'
+        icon = '🟢' if price_data['p1h'] >= 0 else '🔴'
         val_1h = format_price(price_data.get('price_1h', 0)) if price_data.get('price_1h') else 'N/A'
-        msg += f"- 1 giờ:   {icon} {price_data['p1h']:+.2f}% ({val_1h})\n"
-        
+        msg += f"├ 1 giờ:   {icon} `{price_data['p1h']:+.2f}%` ({val_1h})\n"
+    
     if price_data.get('p24h') is not None:
-        icon = '📈' if price_data['p24h'] >= 0 else '📉'
+        icon = '🟢' if price_data['p24h'] >= 0 else '🔴'
         val_24h = format_price(price_data.get('price_24h', 0)) if price_data.get('price_24h') else 'N/A'
-        msg += f"- 24 giờ: {icon} {price_data['p24h']:+.2f}% ({val_24h})\n"
-
-    msg += "--------------------\n"
-    msg += f"Tổng KL (24h): ${price_data['vol']:,.0f} {price_data['vol_unit']}\n"
-
+        msg += f"└ 24 giờ:  {icon} `{price_data['p24h']:+.2f}%` ({val_24h})\n"
+    
+    msg += "──────────────────────\n"
+    msg += f"📈 KL giao dịch 24h: `${price_data['vol']:,.0f}`\n"
+    
     if cg_info:
-        msg += "--------------------\n"
-        msg += f"ATH (CoinGecko): {format_price(cg_info['ath'])} ({cg_info['ath_change']:+.2f}%)\n"
-        msg += f"- Ngày ATH: {cg_info['ath_date']}\n"
-        msg += "--------------------\n"
-        msg += "Thống kê (CoinGecko):\n"
-        msg += f"- Vốn hóa TT: ${cg_info['cap']:,.0f}\n"
-        msg += f"- Lưu thông: {cg_info['circulating']:,.0f}\n"
-        val_supply = f"{cg_info['total_supply']:,.0f}" if cg_info['total_supply'] else "∞"
-        msg += f"- Tổng cung: {val_supply}\n"
-
-    msg += f"\n_{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}_"
+        msg += "══════════════════════\n"
+        msg += "📋 **THÔNG TIN THỊ TRƯỜNG**\n"
+        
+        if cg_info.get('rank'):
+            msg += f"├ Xếp hạng: `#{cg_info['rank']}`\n"
+        
+        if cg_info.get('high_24h') and cg_info.get('low_24h'):
+            msg += f"├ Cao 24h: `{format_price(cg_info['high_24h'])}`\n"
+            msg += f"├ Thấp 24h: `{format_price(cg_info['low_24h'])}`\n"
+        
+        if cg_info.get('change_7d'):
+            icon = '🟢' if cg_info['change_7d'] >= 0 else '🔴'
+            msg += f"├ 7 ngày: {icon} `{cg_info['change_7d']:+.2f}%`\n"
+        if cg_info.get('change_30d'):
+            icon = '🟢' if cg_info['change_30d'] >= 0 else '🔴'
+            msg += f"└ 30 ngày: {icon} `{cg_info['change_30d']:+.2f}%`\n"
+        
+        msg += "──────────────────────\n"
+        msg += "🏆 **ALL-TIME HIGH (ATH)**\n"
+        msg += f"├ Giá ATH: `{format_price(cg_info['ath'])}`\n"
+        msg += f"├ Từ ATH: `{cg_info['ath_change']:+.2f}%`\n"
+        msg += f"└ Ngày: `{cg_info['ath_date']}`\n"
+        
+        if cg_info.get('atl'):
+            msg += "──────────────────────\n"
+            msg += "📉 **ALL-TIME LOW (ATL)**\n"
+            msg += f"├ Giá ATL: `{format_price(cg_info['atl'])}`\n"
+            msg += f"├ Từ ATL: `{cg_info['atl_change']:+.2f}%`\n"
+            msg += f"└ Ngày: `{cg_info['atl_date']}`\n"
+        
+        msg += "──────────────────────\n"
+        msg += "💎 **VỐN HÓA & CUNG**\n"
+        msg += f"├ Vốn hóa: `${cg_info['cap']:,.0f}`\n"
+        
+        if cg_info.get('fdv'):
+            msg += f"├ FDV: `${cg_info['fdv']:,.0f}`\n"
+        
+        msg += f"├ Lưu thông: `{cg_info['circulating']:,.0f}`\n"
+        
+        total_supply = f"{cg_info['total_supply']:,.0f}" if cg_info.get('total_supply') else "∞"
+        msg += f"├ Tổng cung: `{total_supply}`\n"
+        
+        max_supply = f"{cg_info['max_supply']:,.0f}" if cg_info.get('max_supply') else "∞"
+        msg += f"└ Cung tối đa: `{max_supply}`\n"
+    
+    # Price prediction
+    prediction = calculate_price_prediction(price_data, cg_info)
+    
+    if prediction:
+        msg += "══════════════════════\n"
+        msg += "🔮 **DỰ ĐOÁN XU HƯỚNG**\n"
+        msg += "──────────────────────\n"
+        msg += f"📊 Xu hướng: {prediction['trend_icon']} **{prediction['trend']}**\n"
+        msg += f"📈 Độ tin cậy: `{prediction['confidence']:.1f}%`\n"
+        msg += "──────────────────────\n"
+        msg += f"├ Tín hiệu Tăng: `{prediction['bullish_score']:.1f}%`\n"
+        msg += f"└ Tín hiệu Giảm: `{prediction['bearish_score']:.1f}%`\n"
+        msg += "──────────────────────\n"
+        msg += "🎯 **MỤC TIÊU GIÁ (24h)**\n"
+        msg += f"🟢 Nếu TĂNG: `{format_price(prediction['target_high'])}` (+{prediction['target_pct_high']:.2f}%)\n"
+        msg += f"🔴 Nếu GIẢM: `{format_price(prediction['target_low'])}` (-{prediction['target_pct_low']:.2f}%)\n"
+        msg += "──────────────────────\n"
+        msg += f"💡 **Gợi ý:** {prediction['recommendation']}\n"
+    
+    # Disclaimer
+    msg += "══════════════════════\n"
+    msg += "⚠️ **CẢNH BÁO:** Đây chỉ là dự đoán!\n"
+    msg += "Chúng tôi không chịu trách nhiệm mất mát.\n"
+    msg += "Hãy DYOR!\n"
+    msg += "══════════════════════\n"
+    msg += f"🕐 `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`"
+    
+    set_cached(cache_key, msg)
     return msg
 
-# --- OTHER FEATURES ---
-async def generate_ccxt_chart(symbol: str, interval: str, theme: str = 'dark') -> tuple[io.BytesIO | None, str | None]:
-    """
-    Vẽ chart với màu nến Xanh/Đỏ chuẩn cho cả Dark và Light theme.
-    """
-    print(f"Vẽ chart {symbol} {interval}...")
-    stables = ['USDT', 'USDC', 'FDUSD', 'USD']
-    for ex_id in SUPPORTED_EXCHANGES:
-        ex = getattr(ccxt, ex_id)()
+
+# ==============================================================================
+# CHART GENERATION
+# ==============================================================================
+
+async def get_chart_image_from_api(symbol: str, interval: str = '1h', theme: str = 'light') -> tuple[io.BytesIO | None, str | None]:
+    """Get chart image from external chart image APIs."""
+    symbol_upper = symbol.upper()
+    
+    tv_intervals = {
+        '1m': '1', '5m': '5', '15m': '15', '30m': '30',
+        '1h': '60', '2h': '120', '4h': '240',
+        '1d': 'D', '1w': 'W', '1M': 'M'
+    }
+    tv_interval = tv_intervals.get(interval, '60')
+    tv_theme = 'dark' if theme == 'dark' else 'light'
+    
+    chart_img_url = (
+        f"https://api.chart-img.com/v1/tradingview/advanced-chart?"
+        f"symbol=BINANCE:{symbol_upper}USDT"
+        f"&interval={tv_interval}"
+        f"&theme={tv_theme}"
+        f"&studies=Volume"
+        f"&width=800"
+        f"&height=450"
+    )
+    
+    try:
+        session = await get_http_session()
+        async with session.get(chart_img_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status == 200:
+                image_data = await resp.read()
+                buf = io.BytesIO(image_data)
+                buf.seek(0)
+                return buf, f"BINANCE:{symbol_upper}USDT"
+    except Exception:
+        pass
+    
+    for exchange in ['BYBIT', 'OKX', 'COINBASE']:
         try:
+            session = await get_http_session()
+            alt_url = (
+                f"https://api.chart-img.com/v1/tradingview/advanced-chart?"
+                f"symbol={exchange}:{symbol_upper}USDT"
+                f"&interval={tv_interval}"
+                f"&theme={tv_theme}"
+                f"&width=800"
+                f"&height=450"
+            )
+            async with session.get(alt_url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                if resp.status == 200:
+                    image_data = await resp.read()
+                    buf = io.BytesIO(image_data)
+                    buf.seek(0)
+                    return buf, f"{exchange}:{symbol_upper}USDT"
+        except Exception:
+            continue
+    
+    return None, None
+
+
+async def generate_ccxt_chart(symbol: str, interval: str, theme: str = 'light') -> tuple[io.BytesIO | None, str | None]:
+    """Generate a candlestick chart using CCXT exchange data."""
+    print(f"Drawing chart {symbol} {interval}...")
+    
+    for ex_id in PRIORITY_EXCHANGES:
+        ex = None
+        try:
+            ex = getattr(ccxt, ex_id)({'timeout': 10000})
             await ex.load_markets()
-            for s in stables:
+            
+            for s in STABLES:
                 pair = f"{symbol.upper()}/{s}"
                 if pair in ex.markets:
                     ohlcv = await ex.fetch_ohlcv(pair, timeframe=interval, limit=100)
-                    if not ohlcv: continue
+                    if not ohlcv:
+                        continue
                     
                     df = pd.DataFrame(ohlcv, columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume'])
                     df['Date'] = pd.to_datetime(df['Date'], unit='ms')
                     df = df.set_index('Date')
                     
-                    # --- CẤU HÌNH MÀU SẮC (FIXED) ---
-                    # up='green', down='red' cho cả hai theme
-                    mc = mpf.make_marketcolors(up='#0ECB81', down='#F6465D', inherit=True) 
+                    mc = mpf.make_marketcolors(
+                        up='#0ECB81',
+                        down='#F6465D',
+                        inherit=True
+                    )
                     
-                    if theme == 'light':
-                        s = mpf.make_mpf_style(base_mpf_style='yahoo', marketcolors=mc)
-                    else:
-                        s = mpf.make_mpf_style(base_mpf_style='nightclouds', marketcolors=mc)
+                    s_style = mpf.make_mpf_style(
+                        base_mpf_style='yahoo' if theme == 'light' else 'nightclouds',
+                        marketcolors=mc,
+                        y_on_right=True
+                    )
                     
                     buf = io.BytesIO()
-                    mpf.plot(df, type='candle', style=s, title=f'\n{ex.name}: {pair} - {interval}', 
-                             volume=True, savefig=dict(fname=buf, dpi=100, pad_inches=0.25))
+                    mpf.plot(
+                        df,
+                        type='candle',
+                        style=s_style,
+                        title=f'\n{ex.name}: {pair} - {interval}',
+                        volume=True,
+                        savefig=dict(fname=buf, dpi=100, pad_inches=0.25)
+                    )
                     buf.seek(0)
                     await ex.close()
                     return buf, f"{ex.name}: {pair}"
-        except: pass
-        finally: await ex.close()
+        except Exception:
+            pass
+        finally:
+            if ex:
+                try:
+                    await ex.close()
+                except Exception:
+                    pass
+    
     return None, None
 
-def generate_coingecko_chart(coin_id: str, interval: str, theme: str = 'dark') -> tuple[io.BytesIO | None, str | None]:
+
+async def generate_coingecko_chart(coin_id: str, interval: str, theme: str = 'light') -> tuple[io.BytesIO | None, str | None]:
+    """Generate a candlestick chart using CoinGecko OHLC data."""
     days = '1' if interval in ['5m', '15m', '1h', '4h'] else '90'
+    url = f"{COINGECKO_API_URL}/coins/{coin_id}/ohlc?vs_currency=usd&days={days}"
+    
+    data = await fetch_json(url, timeout=10)
+    if not data:
+        return None, None
+    
     try:
-        url = f"{COINGECKO_API_URL}/coins/{coin_id}/ohlc?vs_currency=usd&days={days}"
-        data = requests.get(url, timeout=10).json()
-        if not data: return None, None
-        
         df = pd.DataFrame(data, columns=['Date', 'Open', 'High', 'Low', 'Close'])
         df['Date'] = pd.to_datetime(df['Date'], unit='ms')
         df = df.set_index('Date')
         
         rule = interval.replace('m', 'T') if interval in ['5m', '15m'] else '1h' if interval in ['1h', '4h'] else '1D'
-        if interval != '1d': df = df.resample(rule).agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last'}).dropna()
+        if interval != '1d':
+            df = df.resample(rule).agg({
+                'Open': 'first',
+                'High': 'max',
+                'Low': 'min',
+                'Close': 'last'
+            }).dropna()
         
-        # --- CẤU HÌNH MÀU SẮC (FIXED) ---
         mc = mpf.make_marketcolors(up='#0ECB81', down='#F6465D', inherit=True)
-        s = mpf.make_mpf_style(base_mpf_style='yahoo' if theme == 'light' else 'nightclouds', marketcolors=mc)
+        s_style = mpf.make_mpf_style(
+            base_mpf_style='yahoo' if theme == 'light' else 'nightclouds',
+            marketcolors=mc,
+            y_on_right=True
+        )
         
         buf = io.BytesIO()
-        mpf.plot(df, type='candle', style=s, title=f'\n{coin_id.upper()} - {interval} (CG)', 
-                 volume=False, savefig=dict(fname=buf, dpi=100, pad_inches=0.25))
+        mpf.plot(
+            df,
+            type='candle',
+            style=s_style,
+            title=f'\n{coin_id.upper()} - {interval} (CG)',
+            volume=False,
+            savefig=dict(fname=buf, dpi=100, pad_inches=0.25)
+        )
         buf.seek(0)
         return buf, coin_id.upper()
-    except: return None, None
+    except Exception:
+        return None, None
 
-# --- FEATURE: ADVANCED BUY/SELL VOLUME ---
+
+# ==============================================================================
+# VOLUME ANALYSIS
+# ==============================================================================
+
 async def get_buy_sell_vol(symbol: str, interval: str) -> str:
-    tf_map = {'15m':'15m', '1h':'1h', '3h':'1h', '24h':'1d', '4h':'4h', '1d':'1d'}
+    """Analyze buy vs sell volume from Binance kline data."""
+    tf_map = {'15m': '15m', '1h': '1h', '3h': '1h', '24h': '1d', '4h': '4h', '1d': '1d'}
     tf = tf_map.get(interval)
     limit = 3 if interval == '3h' else 1
+    
+    pair = f"{symbol.upper()}USDT"
+    url = f"{BINANCE_API_URL}/klines?symbol={pair}&interval={tf}&limit={limit}"
+    
+    klines = await fetch_json(url, timeout=10)
+    if not klines:
+        return f"😕 Không tìm thấy volume Binance cho {symbol.upper()}."
+    
     try:
-        pair = f"{symbol.upper()}USDT"
-        url = f"{BINANCE_API_URL}/klines?symbol={pair}&interval={tf}&limit={limit}"
-        resp = requests.get(url, timeout=10)
-        klines = resp.json() if resp.status_code == 200 else None
-        if not klines: return f"😕 Không tìm thấy volume Binance cho {symbol.upper()}."
         total = sum(float(k[5]) for k in klines)
         buy = sum(float(k[9]) for k in klines)
         sell = total - buy
-        if total == 0: return "Volume 0."
-        pct = (buy/total)*100
+        
+        if total == 0:
+            return "Volume 0."
+        
+        pct = (buy / total) * 100
         net = buy - sell
         state = "🟢 MUA > BÁN" if pct > 50 else "🔴 BÁN > MUA"
-        return (f"📊 **Vol {symbol.upper()} ({interval})**\nNguồn: `Binance Spot`\n----------------\n**{state}**\n"
-                f"🟢 Mua: `{format_price(buy)}` ({pct:.1f}%)\n🔴 Bán: `{format_price(sell)}` ({100-pct:.1f}%)\n"
-                f"⚖️ Ròng: `{format_price(net)}` {symbol.upper()}")
-    except: return "Lỗi phân tích volume."
+        
+        return (
+            f"📊 **Vol {symbol.upper()} ({interval})**\n"
+            f"Nguồn: `Binance Spot`\n"
+            f"----------------\n"
+            f"**{state}**\n"
+            f"🟢 Mua: `{format_price(buy)}` ({pct:.1f}%)\n"
+            f"🔴 Bán: `{format_price(sell)}` ({100-pct:.1f}%)\n"
+            f"⚖️ Ròng: `{format_price(net)}` {symbol.upper()}"
+        )
+    except Exception:
+        return "Lỗi phân tích volume."
+
+
+# ==============================================================================
+# UTILITY FUNCTIONS
+# ==============================================================================
 
 async def get_current_price(symbol: str) -> tuple[float | None, str | None]:
-    """Lấy giá hiện tại (dùng cho /cal)"""
-    stables = ['USDT', 'USDC', 'FDUSD', 'USD']
-    for ex_id in ['binance', 'gateio', 'mexc']: 
-        ex = getattr(ccxt, ex_id)()
-        try:
-            for s in stables:
-                t = await ex.fetch_ticker(f"{symbol.upper()}/{s}")
-                if t and t.get('last'): 
-                    await ex.close()
-                    return t['last'], ex.name
-        except: pass
-        finally: await ex.close()
+    """Get current price quickly."""
+    cache_key = f"price_{symbol.lower()}"
+    cached = get_cached(cache_key, ttl=10)
+    if cached:
+        return cached
     
-    cid = get_coingecko_id(symbol)
-    if cid:
+    for stable in ['USDT', 'USDC']:
+        url = f"{BINANCE_API_URL}/ticker/price?symbol={symbol.upper()}{stable}"
+        data = await fetch_json(url, timeout=3)
+        if data and 'price' in data:
+            price = float(data['price'])
+            result = (price, "Binance")
+            set_cached(cache_key, result)
+            return result
+    
+    for ex_id in ['gateio', 'mexc']:
+        ex = None
         try:
-            p = requests.get(f"{COINGECKO_API_URL}/simple/price?ids={cid}&vs_currencies=usd", timeout=10).json()
-            if p.get(cid, {}).get('usd'): return float(p[cid]['usd']), "CoinGecko"
-        except: pass
+            ex = getattr(ccxt, ex_id)({'timeout': 5000})
+            for s in STABLES:
+                try:
+                    t = await ex.fetch_ticker(f"{symbol.upper()}/{s}")
+                    if t and t.get('last'):
+                        result = (t['last'], ex.name)
+                        set_cached(cache_key, result)
+                        await ex.close()
+                        return result
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        finally:
+            if ex:
+                try:
+                    await ex.close()
+                except Exception:
+                    pass
+    
+    cid = await get_coingecko_id(symbol)
+    if cid:
+        data = await fetch_json(f"{COINGECKO_API_URL}/simple/price?ids={cid}&vs_currencies=usd")
+        if data and data.get(cid, {}).get('usd'):
+            result = (float(data[cid]['usd']), "CoinGecko")
+            set_cached(cache_key, result)
+            return result
+    
     return None, "Không tìm thấy giá."
 
+
 async def get_dex_data(address: str) -> str:
-    try:
-        d = requests.get(f"{DEXSCREENER_API_URL}/search?q={address}", timeout=10).json()
-        if not d.get('pairs'): return "NOT_FOUND"
-        p = d['pairs'][0]
-        return (f"🪙 **{p['baseToken']['name']}** (DexScreener)\nPrice: {format_price(float(p['priceUsd']))}\n"
-                f"Vol 24h: `${p.get('volume', {}).get('h24', 0):,.0f}`")
-    except: return "NOT_FOUND"
+    """Get token data from DexScreener by contract address."""
+    data = await fetch_json(f"{DEXSCREENER_API_URL}/search?q={address}", timeout=10)
+    
+    if not data or not data.get('pairs'):
+        return "NOT_FOUND"
+    
+    p = data['pairs'][0]
+    return (
+        f"🪙 **{p['baseToken']['name']}** (DexScreener)\n"
+        f"Price: {format_price(float(p['priceUsd']))}\n"
+        f"Vol 24h: `${p.get('volume', {}).get('h24', 0):,.0f}`"
+    )
+
 
 async def get_volume_data(symbol: str, date_str: str = None) -> str:
-    cid = get_coingecko_id(symbol)
-    if not cid: return "❌ Không tìm thấy coin."
+    """Get volume data from CoinGecko."""
+    cid = await get_coingecko_id(symbol)
+    if not cid:
+        return "❌ Không tìm thấy coin."
+    
     try:
         if date_str:
             dt = datetime.strptime(date_str, '%Y%m%d').strftime('%d-%m-%Y')
-            d = requests.get(f"{COINGECKO_API_URL}/coins/{cid}/history?date={dt}", timeout=10).json()
-            vol = d.get('market_data', {}).get('total_volume', {}).get('usd')
-            return f"📊 **Vol {symbol.upper()} ngày {date_str}:** `${int(vol):,}`" if vol else "Không có dữ liệu."
+            data = await fetch_json(f"{COINGECKO_API_URL}/coins/{cid}/history?date={dt}", timeout=10)
+            if data:
+                vol = data.get('market_data', {}).get('total_volume', {}).get('usd')
+                return f"📊 **Vol {symbol.upper()} ngày {date_str}:** `${int(vol):,}`" if vol else "Không có dữ liệu."
         else:
-            d = requests.get(f"{COINGECKO_API_URL}/coins/{cid}/market_chart?vs_currency=usd&days=max&interval=daily", timeout=10).json()
-            vols = d.get('total_volumes', [])
-            total = sum(x[1] for x in vols)
-            return f"📊 **Tổng Vol Tích Lũy {symbol.upper()}:** `${int(total):,}`"
-    except: return "Lỗi dữ liệu."
+            data = await fetch_json(f"{COINGECKO_API_URL}/coins/{cid}/market_chart?vs_currency=usd&days=max&interval=daily", timeout=10)
+            if data:
+                vols = data.get('total_volumes', [])
+                total = sum(x[1] for x in vols)
+                return f"📊 **Tổng Vol Tích Lũy {symbol.upper()}:** `${int(total):,}`"
+    except Exception:
+        pass
+    return "Lỗi dữ liệu."
+
 
 async def get_trending() -> str:
-    try:
-        d = requests.get(f"{COINGECKO_API_URL}/search/trending", timeout=10).json()
-        msg = "🔥 **Trending:**\n"
-        for i, c in enumerate(d['coins'][:7]): msg += f"{i+1}. {c['item']['symbol']}\n"
-        return msg
-    except: return "Lỗi trending."
+    """Get trending cryptocurrencies from CoinGecko."""
+    cached = get_cached("trending", ttl=60)
+    if cached:
+        return cached
+    
+    data = await fetch_json(f"{COINGECKO_API_URL}/search/trending", timeout=10)
+    if not data:
+        return "Lỗi trending."
+    
+    msg = "🔥 **Trending:**\n"
+    for i, c in enumerate(data.get('coins', [])[:7]):
+        msg += f"{i+1}. {c['item']['symbol']}\n"
+    
+    set_cached("trending", msg)
+    return msg
 
-async def get_market(order, limit=10):
+
+async def get_market(order: str, limit: int = 10) -> str:
+    """Get top gainers or losers from CoinGecko."""
+    cache_key = f"market_{order}"
+    cached = get_cached(cache_key, ttl=60)
+    if cached:
+        return cached
+    
     sort = 'price_change_percentage_24h_desc' if order == 'gainers' else 'price_change_percentage_24h_asc'
-    try:
-        d = requests.get(f"{COINGECKO_API_URL}/coins/markets?vs_currency=usd&order={sort}&per_page={limit}", timeout=10).json()
-        msg = f"📊 **Top {order.title()}**\n"
-        for c in d: msg += f"{c['symbol'].upper()}: {format_price(c['current_price'])} ({c['price_change_percentage_24h']:+.2f}%)\n"
-        return msg
-    except: return "Lỗi market data."
+    url = f"{COINGECKO_API_URL}/coins/markets?vs_currency=usd&order={sort}&per_page={limit}"
+    
+    data = await fetch_json(url, timeout=10)
+    if not data:
+        return "Lỗi market data."
+    
+    msg = f"📊 **Top {order.title()}**\n"
+    for c in data:
+        change = c.get('price_change_percentage_24h', 0) or 0
+        msg += f"{c['symbol'].upper()}: {format_price(c['current_price'])} ({change:+.2f}%)\n"
+    
+    set_cached(cache_key, msg)
+    return msg
 
-# --- COMMAND HANDLERS ---
+
+# ==============================================================================
+# TELEGRAM COMMAND HANDLERS
+# ==============================================================================
+
 async def start_cmd(update, context):
-    await update.message.reply_text(
-        "🤖 **Crypto Bot Pro**\n"
-        "`/<coin> {15m, 1h, 3h, 24h}` (vd /sui 1h)\n"
-        "`/p <symbol>` - Xem giá chi tiết\n"
-        "`/ch <symbol>` - Xem chart\n"
-        "`/cal <coin> <amount>`\n"
-        "`/vol <coin> [date]`, `/ath <coin>`\n"
-        "`/trending`, `/buy`, `/sell`\n"
-        "`$symbol`, `contract`",
-        parse_mode=ParseMode.MARKDOWN
-    )
+    """Handle start command - Display help message."""
+    msg = update.message or update.channel_post
+    if not msg:
+        return
+    
+    help_text = """
+🤖 **CRYPTO BOT PRO v3.0**
+══════════════════════
+
+📌 **Lưu ý:** Tất cả lệnh đều hoạt động CÓ hoặc KHÔNG có dấu `/`
+
+📊 **XEM GIÁ & THÔNG TIN**
+├ `p btc` hoặc `/p btc` - Xem giá chi tiết
+├ `ath eth` - Xem ATH & thông tin
+└ `$sol` - Xem giá nhanh
+
+📈 **XEM CHART**
+├ `ch btc` - Chart BTC 1h (mặc định light)
+├ `ch btc 4h` - Chart 4 giờ
+└ `ch btc 1d dark` - Chart ngày, nền tối
+
+📉 **PHÂN TÍCH VOLUME**
+├ `btc 1h` hoặc `/btc 1h` - Vol 1 giờ
+├ `eth 15m` - Vol 15 phút
+└ `sol 24h` - Vol 24 giờ
+
+🧮 **TÍNH TOÁN**
+├ `cal btc 0.5` - Tính giá trị 0.5 BTC
+└ `val 100 * 2.5` - Máy tính
+
+📋 **THỊ TRƯỜNG**
+├ `trending` - Coin trending
+├ `buy` - Top tăng giá
+├ `sell` - Top giảm giá
+└ `vol btc` - Volume tích lũy
+
+🔍 **KHÁC**
+└ `0x...` - Tra cứu contract
+
+══════════════════════
+⏱️ Timeframes: `15m, 1h, 3h, 4h, 24h`
+🎨 Themes: `light` (mặc định), `dark`
+"""
+    await msg.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
+
 
 async def chart_cmd(update, context):
+    """Handle chart command - Generate and send candlestick chart."""
     msg = update.message or update.channel_post
-    if not msg: return
-    parts = msg.text.split()
-    if len(parts)<2: return await msg.reply_text("Thiếu symbol.")
+    if not msg:
+        return
+    
+    txt = msg.text.strip()
+    if txt.startswith('/'):
+        txt = txt[1:]
+    
+    parts = txt.split()
+    if len(parts) < 2:
+        return await msg.reply_text("⚠️ Thiếu symbol. Ví dụ: `ch btc` hoặc `/ch btc 4h`", parse_mode=ParseMode.MARKDOWN)
+    
     sym = parts[1]
-    tf = parts[2] if len(parts)>2 else '1h'
-    theme = 'light' if 'light' in parts else 'dark'
-    wait = await msg.reply_text(f"⏳ Vẽ chart {sym}...")
-    buf, name = await generate_ccxt_chart(sym, tf, theme)
-    if not buf: 
-        cid = get_coingecko_id(sym)
-        if cid: buf, name = generate_coingecko_chart(cid, tf, theme)
-    await context.bot.delete_message(msg.chat.id, wait.message_id)
-    if buf: await msg.reply_photo(buf, caption=f"{name} {tf}")
-    else: await msg.reply_text("Không vẽ được chart.")
+    tf = parts[2] if len(parts) > 2 else '1h'
+    theme = 'dark' if 'dark' in [p.lower() for p in parts] else 'light'
+    
+    wait = await msg.reply_text(f"⏳ Đang tải chart {sym}...")
+    
+    buf, name = None, None
+    
+    # Try fast API-based chart first
+    buf, name = await get_chart_image_from_api(sym, tf, theme)
+    
+    # Fallback to local CCXT generation
+    if not buf:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=msg.chat.id,
+                message_id=wait.message_id,
+                text=f"⏳ Đang vẽ chart {sym}..."
+            )
+        except Exception:
+            pass
+        buf, name = await generate_ccxt_chart(sym, tf, theme)
+    
+    # Fallback to CoinGecko
+    if not buf:
+        cid = await get_coingecko_id(sym)
+        if cid:
+            buf, name = await generate_coingecko_chart(cid, tf, theme)
+    
+    try:
+        await context.bot.delete_message(msg.chat.id, wait.message_id)
+    except Exception:
+        pass
+    
+    if buf:
+        await msg.reply_photo(buf, caption=f"📊 {name} | {tf}")
+    else:
+        await msg.reply_text("❌ Không tìm thấy chart. Thử symbol khác.")
+
 
 async def vol_analysis_handler(update, context):
+    """Handle volume analysis command."""
     msg = update.message or update.channel_post
-    if not msg: return
-    match = re.match(r'^/([a-zA-Z0-9]{2,10})\s+(15m|1h|3h|4h|24h)$', msg.text.strip(), re.IGNORECASE)
-    if not match: return
+    if not msg:
+        return
+    
+    txt = msg.text.strip()
+    if txt.startswith('/'):
+        txt = txt[1:]
+    
+    match = re.match(r'^([a-zA-Z0-9]{2,10})\s+(15m|1h|3h|4h|24h)$', txt, re.IGNORECASE)
+    if not match:
+        return
+    
     sym = match.group(1)
     tf = match.group(2).lower()
+    
     wait = await msg.reply_text(f"⏳ Phân tích vol {sym} {tf}...")
     res = await get_buy_sell_vol(sym, tf)
-    await context.bot.edit_message_text(chat_id=msg.chat.id, message_id=wait.message_id, text=res, parse_mode=ParseMode.MARKDOWN)
+    try:
+        await context.bot.edit_message_text(
+            chat_id=msg.chat.id,
+            message_id=wait.message_id,
+            text=res,
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception:
+        await msg.reply_text(res, parse_mode=ParseMode.MARKDOWN)
 
-async def ath_cmd(update, context):
-    msg = update.message or update.channel_post
-    if not msg: return
-    parts = msg.text.split()
-    if len(parts) < 2: return
-    res = await get_token_report(parts[1])
-    await msg.reply_text(res, parse_mode=ParseMode.MARKDOWN)
 
 async def calculate_cmd(update, context):
+    """Handle calculate command - Calculate token value."""
     msg = update.message or update.channel_post
-    if not msg: return
-    parts = msg.text.strip().split()
-    if len(parts) < 3:
-        await msg.reply_text("⚠️ Dùng: `/cal <ký hiệu> <số lượng>`", parse_mode=ParseMode.MARKDOWN)
+    if not msg:
         return
+    
+    txt = msg.text.strip()
+    if txt.startswith('/'):
+        txt = txt[1:]
+    
+    parts = txt.split()
+    if len(parts) < 3:
+        await msg.reply_text("⚠️ Dùng: `cal <ký hiệu> <số lượng>`\nVí dụ: `cal btc 0.5`", parse_mode=ParseMode.MARKDOWN)
+        return
+    
     symbol = parts[1]
-    try: amount = float(parts[2])
-    except: return
+    try:
+        amount = float(parts[2])
+    except ValueError:
+        await msg.reply_text("⚠️ Số lượng không hợp lệ!", parse_mode=ParseMode.MARKDOWN)
+        return
+    
     wait = await msg.reply_text(f"🔍 Tính toán {symbol}...")
     p, src = await get_current_price(symbol)
+    
     if p:
         total = p * amount
-        res = (f"💰 **Kết quả tính toán**\n--------------------\n"
-               f"💵 **Giá:** `{format_price(p)}` / {symbol.upper()}\n"
-               f"🔢 **SL:** `{amount:g}`\n"
-               f"--------------------\n💎 **Tổng:** `{format_price(total)}`")
-    else: res = f"😕 Không tìm thấy giá {symbol.upper()}."
-    await context.bot.edit_message_text(chat_id=msg.chat.id, message_id=wait.message_id, text=res, parse_mode=ParseMode.MARKDOWN)
+        res = (
+            f"💰 **Kết quả tính toán**\n"
+            f"--------------------\n"
+            f"💵 **Giá:** `{format_price(p)}` / {symbol.upper()}\n"
+            f"🔢 **SL:** `{amount:g}`\n"
+            f"--------------------\n"
+            f"💎 **Tổng:** `{format_price(total)}`"
+        )
+    else:
+        res = f"😕 Không tìm thấy giá {symbol.upper()}."
+    
+    try:
+        await context.bot.edit_message_text(
+            chat_id=msg.chat.id,
+            message_id=wait.message_id,
+            text=res,
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception:
+        await msg.reply_text(res, parse_mode=ParseMode.MARKDOWN)
+
 
 async def vol_cmd(update, context):
+    """Handle volume command - Get volume data."""
     msg = update.message or update.channel_post
-    parts = msg.text.split()
-    if len(parts) < 2: return
+    if not msg:
+        return
+    
+    txt = msg.text.strip()
+    if txt.startswith('/'):
+        txt = txt[1:]
+    
+    parts = txt.split()
+    if len(parts) < 2:
+        await msg.reply_text("⚠️ Dùng: `vol <symbol>` hoặc `vol <symbol> <YYYYMMDD>`", parse_mode=ParseMode.MARKDOWN)
+        return
+    
     sym = parts[1]
     date_str = parts[2] if len(parts) > 2 else None
+    
     wait = await msg.reply_text("⏳ Check vol...")
     res = await get_volume_data(sym, date_str)
-    await context.bot.edit_message_text(chat_id=msg.chat.id, message_id=wait.message_id, text=res, parse_mode=ParseMode.MARKDOWN)
+    try:
+        await context.bot.edit_message_text(
+            chat_id=msg.chat.id,
+            message_id=wait.message_id,
+            text=res,
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception:
+        await msg.reply_text(res, parse_mode=ParseMode.MARKDOWN)
+
 
 async def trending_cmd(update, context):
+    """Handle trending command - Show trending coins."""
+    msg = update.message or update.channel_post
+    if not msg:
+        return
     res = await get_trending()
-    await update.message.reply_text(res, parse_mode=ParseMode.MARKDOWN)
+    await msg.reply_text(res, parse_mode=ParseMode.MARKDOWN)
+
 
 async def buy_cmd(update, context):
+    """Handle buy command - Show top gainers."""
+    msg = update.message or update.channel_post
+    if not msg:
+        return
     res = await get_market('gainers')
-    await update.message.reply_text(res, parse_mode=ParseMode.MARKDOWN)
+    await msg.reply_text(res, parse_mode=ParseMode.MARKDOWN)
+
 
 async def sell_cmd(update, context):
+    """Handle sell command - Show top losers."""
+    msg = update.message or update.channel_post
+    if not msg:
+        return
     res = await get_market('losers')
-    await update.message.reply_text(res, parse_mode=ParseMode.MARKDOWN)
+    await msg.reply_text(res, parse_mode=ParseMode.MARKDOWN)
+
 
 async def value_cmd(update, context):
+    """Handle value/math command - Evaluate math expression."""
     msg = update.message or update.channel_post
+    if not msg:
+        return
+    
     txt = msg.text.strip()
-    expr = txt.split(maxsplit=1)[1] if len(txt.split()) > 1 else ""
+    if txt.startswith('/'):
+        txt = txt[1:]
+    
+    parts = txt.split(maxsplit=1)
+    expr = parts[1] if len(parts) > 1 else ""
+    
+    if not expr:
+        await msg.reply_text("⚠️ Dùng: `val <biểu thức>`\nVí dụ: `val 100 * 2.5 + 50`", parse_mode=ParseMode.MARKDOWN)
+        return
+    
     res = safe_eval(expr)
-    if res is not None: await msg.reply_text(f"🧮 = `{res}`", parse_mode=ParseMode.MARKDOWN)
+    if res is not None:
+        await msg.reply_text(f"🧮 Kết quả: `{res}`", parse_mode=ParseMode.MARKDOWN)
+    else:
+        await msg.reply_text("⚠️ Biểu thức không hợp lệ!", parse_mode=ParseMode.MARKDOWN)
+
+
+# ==============================================================================
+# MAIN MESSAGE HANDLER
+# ==============================================================================
+
+def normalize_command(text: str) -> str:
+    """Normalize command text by removing leading slash if present."""
+    if text.startswith('/'):
+        return text[1:]
+    return text
+
 
 async def handle_msg(update, context):
+    """Main message handler - Routes incoming messages to appropriate handlers."""
     msg = update.message or update.channel_post
-    if not msg or not msg.text: return
+    if not msg or not msg.text:
+        return
+    
     txt = msg.text.strip()
-    txt_lower = txt.lower()
-
-    if re.match(r'^/[a-zA-Z0-9]{2,10}\s+(15m|1h|3h|4h|24h)$', txt, re.IGNORECASE):
+    txt_normalized = normalize_command(txt)
+    txt_norm_lower = txt_normalized.lower()
+    
+    # Volume analysis: [/]<coin> <timeframe>
+    if re.match(r'^[a-zA-Z0-9]{2,10}\s+(15m|1h|3h|4h|24h)$', txt_normalized, re.IGNORECASE):
         return await vol_analysis_handler(update, context)
-
-    if txt_lower.startswith('/ch '): return await chart_cmd(update, context)
-    if txt_lower.startswith('/start'): return await start_cmd(update, context)
-    if txt_lower.startswith('/p ') or txt_lower.startswith('/ath '): 
-        parts = txt.split()
+    
+    # Chart command: [/]ch <symbol>
+    if txt_norm_lower.startswith('ch '):
+        return await chart_cmd(update, context)
+    
+    # Start/Help command: [/]start
+    if txt_norm_lower == 'start' or txt_norm_lower.startswith('start '):
+        return await start_cmd(update, context)
+    
+    # Price report command: [/]p <symbol>
+    if txt_norm_lower.startswith('p '):
+        parts = txt_normalized.split()
         if len(parts) > 1:
             res = await get_token_report(parts[1])
             await msg.reply_text(res, parse_mode=ParseMode.MARKDOWN)
         return
-    if txt_lower.startswith(('/cal ', 'cal ')): return await calculate_cmd(update, context)
-    if txt_lower.startswith(('/val ', 'val ')): return await value_cmd(update, context)
-    if txt_lower.startswith('/trending'): return await trending_cmd(update, context)
-    if txt_lower.startswith('/buy'): return await buy_cmd(update, context)
-    if txt_lower.startswith('/sell'): return await sell_cmd(update, context)
-    if txt_lower.startswith('/vol'): return await vol_cmd(update, context)
-
-    # Price Lookup ($symbol)
+    
+    # ATH command: [/]ath <symbol>
+    if txt_norm_lower.startswith('ath '):
+        parts = txt_normalized.split()
+        if len(parts) > 1:
+            res = await get_token_report(parts[1])
+            await msg.reply_text(res, parse_mode=ParseMode.MARKDOWN)
+        return
+    
+    # Calculator command: [/]cal <symbol> <amount>
+    if txt_norm_lower.startswith('cal '):
+        return await calculate_cmd(update, context)
+    
+    # Value/Math expression command: [/]val <expression>
+    if txt_norm_lower.startswith('val '):
+        return await value_cmd(update, context)
+    
+    # Trending command: [/]trending
+    if txt_norm_lower == 'trending' or txt_norm_lower.startswith('trending '):
+        return await trending_cmd(update, context)
+    
+    # Buy (top gainers) command: [/]buy
+    if txt_norm_lower == 'buy' or txt_norm_lower.startswith('buy '):
+        return await buy_cmd(update, context)
+    
+    # Sell (top losers) command: [/]sell
+    if txt_norm_lower == 'sell' or txt_norm_lower.startswith('sell '):
+        return await sell_cmd(update, context)
+    
+    # Volume command: [/]vol <symbol>
+    if txt_norm_lower.startswith('vol '):
+        return await vol_cmd(update, context)
+    
+    # Quick price lookup with $ prefix
     if txt.startswith('$') and len(txt) > 1:
         sym = txt[1:]
         if VALID_SYMBOL_PATTERN.match(sym):
             res = await get_token_report(sym)
             await msg.reply_text(res, parse_mode=ParseMode.MARKDOWN)
         return
-
+    
+    # Contract address lookup
     if is_contract_address(txt):
         res = await get_dex_data(txt)
         if res == "NOT_FOUND":
-             info = get_info_from_contract(txt)
-             if info: res = await get_token_report(info['symbol'])
-             else: res = "❌ Không tìm thấy contract."
+            res = "❌ Không tìm thấy contract."
         await msg.reply_text(res, parse_mode=ParseMode.MARKDOWN)
 
+
+# ==============================================================================
+# MAIN ENTRY POINT
+# ==============================================================================
+
 def main():
+    """Initialize and run the Telegram bot."""
     print("Bot started...")
+    
     app = Application.builder().token(BOT_TOKEN).connect_timeout(30).read_timeout(60).build()
     app.add_handler(MessageHandler(filters.TEXT | filters.COMMAND, handle_msg))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == '__main__':
     main()

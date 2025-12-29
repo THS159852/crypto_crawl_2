@@ -968,6 +968,202 @@ async def get_market(order: str, limit: int = 10) -> str:
 
 
 # ==============================================================================
+# BINANCE ALPHA COMPETITION
+# ==============================================================================
+
+# Lưu trữ dữ liệu competition (có thể cập nhật từ admin hoặc API)
+ALPHA_COMPETITIONS = []
+
+
+def update_alpha_competitions(competitions: list):
+    """Cập nhật danh sách competition từ bên ngoài."""
+    global ALPHA_COMPETITIONS
+    ALPHA_COMPETITIONS = competitions
+
+
+async def get_alpha_competitions_from_web() -> list:
+    """
+    Cố gắng lấy dữ liệu Alpha Competition từ các nguồn có sẵn.
+    Lưu ý: Binance không có API công khai cho dữ liệu này.
+    """
+    # Thử lấy từ DexScreener để có thông tin token
+    competitions = []
+    
+    # Danh sách các token Alpha phổ biến (có thể cập nhật)
+    alpha_tokens = ['STAR', 'KGEN', 'RAVE', 'ZKP', 'VINE', 'B2', 'BROCCOLI', 'TUT', 'BMT']
+    
+    for token in alpha_tokens:
+        try:
+            # Lấy giá từ DexScreener
+            url = f"{DEXSCREENER_API_URL}/search?q={token}"
+            data = await fetch_json(url, timeout=5)
+            
+            if data and data.get('pairs'):
+                # Lấy pair có liquidity cao nhất
+                pairs = [p for p in data['pairs'] if p.get('baseToken', {}).get('symbol', '').upper() == token.upper()]
+                if pairs:
+                    best_pair = max(pairs, key=lambda x: x.get('liquidity', {}).get('usd', 0))
+                    
+                    price = float(best_pair.get('priceUsd', 0))
+                    volume_24h = best_pair.get('volume', {}).get('h24', 0)
+                    price_change = best_pair.get('priceChange', {}).get('h24', 0)
+                    liquidity = best_pair.get('liquidity', {}).get('usd', 0)
+                    
+                    competitions.append({
+                        'symbol': token,
+                        'name': best_pair.get('baseToken', {}).get('name', token),
+                        'price': price,
+                        'volume_24h': volume_24h,
+                        'price_change_24h': price_change,
+                        'liquidity': liquidity,
+                        'chain': best_pair.get('chainId', 'unknown'),
+                        'dex': best_pair.get('dexId', 'unknown'),
+                    })
+        except Exception:
+            continue
+    
+    return competitions
+
+
+async def get_alpha_competition_report() -> str:
+    """Tạo báo cáo Alpha Competition."""
+    cache_key = "alpha_competition"
+    cached = get_cached(cache_key, ttl=120)
+    if cached:
+        return cached
+    
+    # Lấy dữ liệu từ web
+    competitions = await get_alpha_competitions_from_web()
+    
+    if not competitions:
+        # Fallback: Hiển thị thông tin cơ bản nếu không lấy được
+        msg = """
+🌊 **BINANCE ALPHA COMPETITION**
+══════════════════════════════
+
+⚠️ **Lưu ý:** Dữ liệu competition cần cập nhật thủ công.
+
+📋 **Các token Alpha đang hot:**
+├ STAR, KGEN, RAVE, ZKP
+├ VINE, B2, BROCCOLI
+└ TUT, BMT
+
+💡 **Cách xem chi tiết:**
+├ Gõ `/p <symbol>` để xem giá
+└ Gõ `/ch <symbol>` để xem chart
+
+🔗 **Link tham khảo:**
+└ https://www.binance.com/en/alpha
+
+══════════════════════════════
+"""
+        return msg
+    
+    # Sắp xếp theo volume 24h
+    competitions.sort(key=lambda x: x.get('volume_24h', 0), reverse=True)
+    
+    now = datetime.now().strftime('%Y-%m-%d')
+    
+    msg = f"""
+🌊 **WAVE ALPHA CHANNEL**
+📅 **Date:** {now}
+══════════════════════════════
+"""
+    
+    for i, comp in enumerate(competitions[:10], 1):
+        symbol = comp.get('symbol', 'N/A')
+        name = comp.get('name', symbol)
+        price = comp.get('price', 0)
+        vol_24h = comp.get('volume_24h', 0)
+        change_24h = comp.get('price_change_24h', 0) or 0
+        liquidity = comp.get('liquidity', 0)
+        chain = comp.get('chain', 'unknown')
+        
+        # Icon dựa trên thay đổi giá
+        change_icon = '📈' if change_24h >= 0 else '📉'
+        
+        msg += f"""
+{'─' * 30}
+🪙 **{symbol}** ({name})
+├ 💰 Price: `{format_price(price)}`
+├ {change_icon} 24h: `{change_24h:+.2f}%`
+├ 📊 Vol 24h: `${vol_24h:,.0f}`
+├ 💎 Liquidity: `${liquidity:,.0f}`
+└ 🔗 Chain: `{chain}`
+"""
+    
+    msg += f"""
+══════════════════════════════
+💡 Gõ `/p <symbol>` để xem chi tiết
+🕐 Cập nhật: {datetime.now().strftime('%H:%M:%S')}
+"""
+    
+    set_cached(cache_key, msg)
+    return msg
+
+
+async def get_alpha_daily_report(date_str: str = None) -> str:
+    """
+    Tạo báo cáo Alpha hàng ngày với thông tin reward.
+    Format giống như trong ảnh Wave Alpha Channel.
+    """
+    if not date_str:
+        date_str = datetime.now().strftime('%Y-%m-%d')
+    
+    cache_key = f"alpha_daily_{date_str}"
+    cached = get_cached(cache_key, ttl=300)
+    if cached:
+        return cached
+    
+    # Lấy dữ liệu token
+    competitions = await get_alpha_competitions_from_web()
+    
+    msg = f"""
+🌊 **WAVE ALPHA CHANNEL**
+👤 **DAILY ALPHA REPORT**
+📅 **Date:** {date_str}
+══════════════════════════════
+"""
+    
+    if not competitions:
+        msg += """
+⚠️ Không thể lấy dữ liệu tự động.
+
+📝 **Để cập nhật dữ liệu reward thủ công:**
+Liên hệ admin hoặc kiểm tra:
+🔗 https://www.binance.com/en/alpha
+══════════════════════════════
+"""
+        return msg
+    
+    for comp in competitions[:8]:
+        symbol = comp.get('symbol', 'N/A')
+        price = comp.get('price', 0)
+        vol_24h = comp.get('volume_24h', 0)
+        change_24h = comp.get('price_change_24h', 0) or 0
+        
+        # Icon thay đổi
+        vol_icon = '📈' if change_24h >= 0 else '📉'
+        
+        msg += f"""
+{'─' * 30}
+🏆 **{symbol}**
+├ 💵 Reward: *Đang cập nhật*
+├ 📊 Min Vol: `${vol_24h/100:,.0f}` {vol_icon}
+└ 📈 Total Vol: `${vol_24h:,.0f}` ({change_24h:+.1f}%)
+"""
+    
+    msg += f"""
+══════════════════════════════
+⚠️ *Reward data cần cập nhật từ Binance*
+🕐 `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`
+"""
+    
+    set_cached(cache_key, msg)
+    return msg
+
+
+# ==============================================================================
 # TELEGRAM COMMAND HANDLERS
 # ==============================================================================
 
@@ -1006,7 +1202,9 @@ async def start_cmd(update, context):
 ├ `trending` - Coin trending
 ├ `buy` - Top tăng giá
 ├ `sell` - Top giảm giá
-└ `vol btc` - Volume tích lũy
+├ `vol btc` - Volume tích lũy
+├ `compe` - Alpha Competition list
+└ `alpha` - Alpha Daily Report
 
 🔍 **KHÁC**
 └ `0x...` - Tra cứu contract
@@ -1209,6 +1407,53 @@ async def sell_cmd(update, context):
     await msg.reply_text(res, parse_mode=ParseMode.MARKDOWN)
 
 
+async def compe_cmd(update, context):
+    """Handle competition command - Show Alpha competition list."""
+    msg = update.message or update.channel_post
+    if not msg:
+        return
+    
+    wait = await msg.reply_text("⏳ Đang tải dữ liệu Alpha Competition...")
+    res = await get_alpha_competition_report()
+    
+    try:
+        await context.bot.edit_message_text(
+            chat_id=msg.chat.id,
+            message_id=wait.message_id,
+            text=res,
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception:
+        await msg.reply_text(res, parse_mode=ParseMode.MARKDOWN)
+
+
+async def alpha_cmd(update, context):
+    """Handle alpha daily report command."""
+    msg = update.message or update.channel_post
+    if not msg:
+        return
+    
+    txt = msg.text.strip()
+    if txt.startswith('/'):
+        txt = txt[1:]
+    
+    parts = txt.split()
+    date_str = parts[1] if len(parts) > 1 else None
+    
+    wait = await msg.reply_text("⏳ Đang tải Alpha Daily Report...")
+    res = await get_alpha_daily_report(date_str)
+    
+    try:
+        await context.bot.edit_message_text(
+            chat_id=msg.chat.id,
+            message_id=wait.message_id,
+            text=res,
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception:
+        await msg.reply_text(res, parse_mode=ParseMode.MARKDOWN)
+
+
 async def value_cmd(update, context):
     """Handle value/math command - Evaluate math expression."""
     msg = update.message or update.channel_post
@@ -1301,6 +1546,14 @@ async def handle_msg(update, context):
     # Sell (top losers) command: [/]sell
     if txt_norm_lower == 'sell' or txt_norm_lower.startswith('sell '):
         return await sell_cmd(update, context)
+    
+    # Competition command: [/]compe
+    if txt_norm_lower == 'compe' or txt_norm_lower.startswith('compe '):
+        return await compe_cmd(update, context)
+    
+    # Alpha daily report command: [/]alpha
+    if txt_norm_lower == 'alpha' or txt_norm_lower.startswith('alpha '):
+        return await alpha_cmd(update, context)
     
     # Volume command: [/]vol <symbol>
     if txt_norm_lower.startswith('vol '):
