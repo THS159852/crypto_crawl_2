@@ -1,1 +1,1 @@
-web: python crypto_bot.py
+worker: python 2_crypto.py

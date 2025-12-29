@@ -1,0 +1,14 @@
+# Bỏ qua các file không cần thiết
+.git
+.gitignore
+.env
+*.md
+*.pyc
+__pycache__
+.venv
+venv
+*.log
+Procfile
+crypto_bot_pythonanywhere_com_wsgi.py
+2_crypto copy.py
+
