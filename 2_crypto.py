@@ -5,16 +5,6 @@ CRYPTO TELEGRAM BOT - Professional Cryptocurrency Price & Chart Bot
 Version: 3.0 (Merged & Optimized)
 Description: A high-performance Telegram bot for real-time cryptocurrency 
              price tracking, candlestick charts, and market analysis.
-
-Features:
-- Real-time price from Binance, CCXT exchanges, DexScreener
-- Candlestick charts with customizable themes
-- Buy/Sell volume analysis
-- Market cap, ATH, ATL and supply information from CoinGecko
-- Price prediction with technical analysis
-- Smart caching for fast response times
-- Async architecture for high concurrency
-- Commands work with or without '/' prefix
 ================================================================================
 """
 
@@ -31,7 +21,6 @@ import pandas as pd
 import mplfinance as mpf
 import ccxt.async_support as ccxt
 from datetime import datetime
-from cachetools import TTLCache
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters
 from telegram.constants import ParseMode
@@ -46,7 +35,7 @@ try:
     if sys.stdout.encoding != 'utf-8':
         sys.stdout.reconfigure(encoding='utf-8')
         sys.stderr.reconfigure(encoding='utf-8')
-except:
+except Exception:
     pass
 
 # Load Environment Variables
@@ -73,12 +62,25 @@ VALID_SYMBOL_PATTERN = re.compile(r'^[a-zA-Z0-9]{1,10}$')
 STABLES = ['USDT', 'USDC', 'FDUSD', 'USD']
 
 # ==============================================================================
-# CACHING SYSTEM
+# SIMPLE CACHING (without cachetools dependency)
 # ==============================================================================
-coingecko_id_cache = TTLCache(maxsize=500, ttl=3600)      # 1 hour
-price_cache = TTLCache(maxsize=200, ttl=10)               # 10 seconds
-market_cache = TTLCache(maxsize=100, ttl=60)              # 1 minute
-cg_info_cache = TTLCache(maxsize=100, ttl=300)            # 5 minutes
+_cache = {}
+_cache_times = {}
+
+
+def get_cached(key: str, ttl: int = 60):
+    """Get cached value if not expired."""
+    if key in _cache and key in _cache_times:
+        if (datetime.now() - _cache_times[key]).total_seconds() < ttl:
+            return _cache[key]
+    return None
+
+
+def set_cached(key: str, value):
+    """Set cached value with current timestamp."""
+    _cache[key] = value
+    _cache_times[key] = datetime.now()
+
 
 # ==============================================================================
 # HTTP SESSION MANAGEMENT
@@ -138,7 +140,7 @@ def safe_eval(expression: str) -> float | None:
         return None
     try:
         return eval(expression, {"__builtins__": {}}, {})
-    except:
+    except Exception:
         return None
 
 
@@ -153,7 +155,7 @@ async def fetch_json(url: str, timeout: float = 5) -> dict | list | None:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
             if resp.status == 200:
                 return await resp.json()
-    except:
+    except Exception:
         pass
     return None
 
@@ -162,15 +164,16 @@ async def get_coingecko_id(symbol: str) -> str | None:
     """Get CoinGecko coin ID from ticker symbol with caching."""
     symbol_lower = symbol.lower()
     
-    if symbol_lower in coingecko_id_cache:
-        return coingecko_id_cache[symbol_lower]
+    cached = get_cached(f"cgid_{symbol_lower}", ttl=3600)
+    if cached:
+        return cached
     
     data = await fetch_json(f"{COINGECKO_API_URL}/search?query={symbol}")
     if data:
         for c in data.get('coins', []):
             if c.get('symbol', '').lower() == symbol_lower:
                 cg_id = c.get('id')
-                coingecko_id_cache[symbol_lower] = cg_id
+                set_cached(f"cgid_{symbol_lower}", cg_id)
                 return cg_id
     return None
 
@@ -179,8 +182,9 @@ async def get_coingecko_info(symbol: str) -> dict | None:
     """Get detailed coin information from CoinGecko with caching."""
     cache_key = f"cg_info_{symbol.lower()}"
     
-    if cache_key in cg_info_cache:
-        return cg_info_cache[cache_key]
+    cached = get_cached(cache_key, ttl=300)
+    if cached:
+        return cached
     
     cid = await get_coingecko_id(symbol)
     if not cid:
@@ -202,28 +206,28 @@ async def get_coingecko_info(symbol: str) -> dict | None:
         'change_24h': md.get('price_change_percentage_24h', 0),
         'change_7d': md.get('price_change_percentage_7d', 0),
         'change_30d': md.get('price_change_percentage_30d', 0),
-            'ath': md.get('ath', {}).get('usd', 0),
-            'ath_change': md.get('ath_change_percentage', {}).get('usd', 0),
-            'ath_date': md.get('ath_date', {}).get('usd', '').split('T')[0],
+        'ath': md.get('ath', {}).get('usd', 0),
+        'ath_change': md.get('ath_change_percentage', {}).get('usd', 0),
+        'ath_date': md.get('ath_date', {}).get('usd', '').split('T')[0] if md.get('ath_date', {}).get('usd') else '',
         'atl': md.get('atl', {}).get('usd', 0),
         'atl_change': md.get('atl_change_percentage', {}).get('usd', 0),
-        'atl_date': md.get('atl_date', {}).get('usd', '').split('T')[0],
-            'cap': md.get('market_cap', {}).get('usd', 0),
+        'atl_date': md.get('atl_date', {}).get('usd', '').split('T')[0] if md.get('atl_date', {}).get('usd') else '',
+        'cap': md.get('market_cap', {}).get('usd', 0),
         'volume_24h': md.get('total_volume', {}).get('usd', 0),
         'fdv': md.get('fully_diluted_valuation', {}).get('usd', 0),
-            'circulating': md.get('circulating_supply', 0),
+        'circulating': md.get('circulating_supply', 0),
         'total_supply': md.get('total_supply', 0),
         'max_supply': md.get('max_supply', 0),
     }
     
-    cg_info_cache[cache_key] = result
+    set_cached(cache_key, result)
     return result
 
 
 async def get_binance_kline_change(trading_pair: str, interval: str, is_future: bool = False) -> float | None:
     """Calculate price change percentage from Binance kline data."""
     api_url = BINANCE_F_API_URL if is_future else BINANCE_API_URL
-        url = f"{api_url}/klines?symbol={trading_pair}&interval={interval}&limit=2"
+    url = f"{api_url}/klines?symbol={trading_pair}&interval={interval}&limit=2"
     
     data = await fetch_json(url)
     if not data or len(data) < 2:
@@ -235,7 +239,7 @@ async def get_binance_kline_change(trading_pair: str, interval: str, is_future: 
         if prev_close == 0:
             return 0.0
         return ((curr_price - prev_close) / prev_close) * 100
-    except:
+    except Exception:
         return None
 
 
@@ -246,37 +250,37 @@ async def get_binance_price_data(symbol: str) -> tuple[dict | None, str, str]:
     async def fetch_binance(is_future: bool, stable: str):
         api_url = BINANCE_F_API_URL if is_future else BINANCE_API_URL
         pair = f"{symbol_upper}{stable}"
-                url = f"{api_url}/ticker/24hr?symbol={pair}"
+        url = f"{api_url}/ticker/24hr?symbol={pair}"
         
         data = await fetch_json(url)
         if not data:
             return None
         
         try:
-                    price = float(data['lastPrice'])
-                    p24h = float(data['priceChangePercent'])
+            price = float(data['lastPrice'])
+            p24h = float(data['priceChangePercent'])
             
             kline_tasks = [
                 get_binance_kline_change(pair, '1h', is_future),
                 get_binance_kline_change(pair, '5m', is_future)
             ]
             p1h, p5m = await asyncio.gather(*kline_tasks)
-                    
-                    price_24h = price / (1 + p24h/100) if p24h != -100 else 0
-                    price_1h = price / (1 + p1h/100) if p1h else 0
-                    price_5m = price / (1 + p5m/100) if p5m else 0
-                    
+            
+            price_24h = price / (1 + p24h/100) if p24h != -100 else 0
+            price_1h = price / (1 + p1h/100) if p1h else 0
+            price_5m = price / (1 + p5m/100) if p5m else 0
+            
             return {
-                        'price': price,
-                        'p5m': p5m, 'price_5m': price_5m,
-                        'p1h': p1h, 'price_1h': price_1h,
-                        'p24h': p24h, 'price_24h': price_24h,
-                        'vol': float(data['quoteVolume']),
+                'price': price,
+                'p5m': p5m, 'price_5m': price_5m,
+                'p1h': p1h, 'price_1h': price_1h,
+                'p24h': p24h, 'price_24h': price_24h,
+                'vol': float(data['quoteVolume']),
                 'vol_unit': stable,
                 'source': "Binance Futures" if is_future else "Sàn Binance",
                 'pair': f"{symbol_upper}/{stable}"
             }
-        except:
+        except Exception:
             return None
     
     tasks = []
@@ -297,7 +301,7 @@ async def get_ccxt_price(symbol: str) -> tuple[dict | None, str, str]:
     """Fetch price from CCXT-supported exchanges as fallback."""
     symbol_upper = symbol.upper()
     
-        for ex_id in ['gateio', 'mexc', 'kucoin', 'okx', 'bybit']:
+    for ex_id in ['gateio', 'mexc', 'kucoin', 'okx', 'bybit']:
         ex = None
         try:
             ex = getattr(ccxt, ex_id)({'timeout': 5000})
@@ -308,27 +312,32 @@ async def get_ccxt_price(symbol: str) -> tuple[dict | None, str, str]:
                     if t and t.get('last'):
                         price = t['last']
                         p24h = t.get('percentage', 0)
-                        return {
+                        result = {
                             'price': price,
                             'p24h': p24h,
                             'price_24h': price / (1 + p24h/100) if p24h else 0,
                             'vol': t.get('quoteVolume', 0),
                             'vol_unit': 'USDT'
-                        }, f"Sàn {ex.name}", t['symbol']
-                except:
+                        }
+                        await ex.close()
+                        return result, f"Sàn {ex.name}", t['symbol']
+                except Exception:
                     continue
-        except:
+        except Exception:
             pass
         finally:
             if ex:
-                        await ex.close()
+                try:
+                    await ex.close()
+                except Exception:
+                    pass
     
     return None, "", ""
 
 
 async def get_dexscreener_price(symbol: str) -> tuple[dict | None, str, str]:
     """Fetch price from DexScreener for DEX-traded tokens."""
-            url = f"{DEXSCREENER_API_URL}/search?q={symbol}"
+    url = f"{DEXSCREENER_API_URL}/search?q={symbol}"
     data = await fetch_json(url)
     
     if not data or not data.get('pairs'):
@@ -337,15 +346,15 @@ async def get_dexscreener_price(symbol: str) -> tuple[dict | None, str, str]:
     p = max(data['pairs'], key=lambda x: x.get('liquidity', {}).get('usd', 0))
     
     try:
-                price = float(p['priceUsd'])
-                price_data = {
-                    'price': price,
-                    'p5m': p.get('priceChange', {}).get('m5'),
-                    'p1h': p.get('priceChange', {}).get('h1'),
-                    'p24h': p.get('priceChange', {}).get('h24'),
-                    'vol': p.get('volume', {}).get('h24', 0),
-                    'vol_unit': 'USD'
-                }
+        price = float(p['priceUsd'])
+        price_data = {
+            'price': price,
+            'p5m': p.get('priceChange', {}).get('m5'),
+            'p1h': p.get('priceChange', {}).get('h1'),
+            'p24h': p.get('priceChange', {}).get('h24'),
+            'vol': p.get('volume', {}).get('h24', 0),
+            'vol_unit': 'USD'
+        }
         
         if price_data['p5m']:
             price_data['price_5m'] = price / (1 + price_data['p5m']/100)
@@ -353,11 +362,11 @@ async def get_dexscreener_price(symbol: str) -> tuple[dict | None, str, str]:
             price_data['price_1h'] = price / (1 + price_data['p1h']/100)
         if price_data['p24h']:
             price_data['price_24h'] = price / (1 + price_data['p24h']/100)
-                
-                source = f"DexScreener ({p.get('dexId')})"
-                pair_name = f"{p['baseToken']['symbol']}/{p['quoteToken']['symbol']}"
+        
+        source = f"DexScreener ({p.get('dexId')})"
+        pair_name = f"{p['baseToken']['symbol']}/{p['quoteToken']['symbol']}"
         return price_data, source, pair_name
-    except:
+    except Exception:
         return None, "", ""
 
 
@@ -405,15 +414,11 @@ def calculate_price_prediction(price_data: dict, cg_info: dict | None) -> dict |
     
     # ATH/ATL analysis
     if cg_info:
-        ath_change = cg_info.get('ath_change', 0)
-        atl_change = cg_info.get('atl_change', 0)
+        ath_change = cg_info.get('ath_change', 0) or 0
         
         if ath_change < -80:
             signals['bullish'] += 3
         elif ath_change < -50:
-            signals['bullish'] += 2
-        
-        if atl_change < 100:
             signals['bullish'] += 2
         
         if ath_change > -10:
@@ -469,8 +474,6 @@ def calculate_price_prediction(price_data: dict, cg_info: dict | None) -> dict |
     
     target_price_high = current_price * (1 + target_pct_high / 100)
     target_price_low = current_price * (1 - target_pct_low / 100)
-    potential_gain = target_price_high - current_price
-    potential_loss = current_price - target_price_low
     
     if trend == 'BULLISH' and confidence > 60:
         recommendation = '📈 Xu hướng LONG'
@@ -489,8 +492,6 @@ def calculate_price_prediction(price_data: dict, cg_info: dict | None) -> dict |
         'target_low': target_price_low,
         'target_pct_high': target_pct_high,
         'target_pct_low': target_pct_low,
-        'potential_gain': potential_gain,
-        'potential_loss': potential_loss,
         'recommendation': recommendation,
     }
 
@@ -504,8 +505,9 @@ async def get_token_report(symbol: str) -> str:
     symbol_upper = symbol.upper()
     
     cache_key = f"report_{symbol_upper}"
-    if cache_key in price_cache:
-        return price_cache[cache_key]
+    cached = get_cached(cache_key, ttl=10)
+    if cached:
+        return cached
     
     # Try Binance first
     price_data, source, pair_name = await get_binance_price_data(symbol)
@@ -517,12 +519,12 @@ async def get_token_report(symbol: str) -> str:
     # Try DexScreener
     if not price_data:
         price_data, source, pair_name = await get_dexscreener_price(symbol)
-
+    
     if not price_data:
         return f"😕 Không tìm thấy thông tin cho **{symbol_upper}**."
-
-    # Fetch CoinGecko info in background
-    cg_task = asyncio.create_task(get_coingecko_info(symbol))
+    
+    # Fetch CoinGecko info
+    cg_info = await get_coingecko_info(symbol)
     
     # Format output
     msg = f"🪙 **{pair_name}**\n"
@@ -541,7 +543,7 @@ async def get_token_report(symbol: str) -> str:
         icon = '🟢' if price_data['p1h'] >= 0 else '🔴'
         val_1h = format_price(price_data.get('price_1h', 0)) if price_data.get('price_1h') else 'N/A'
         msg += f"├ 1 giờ:   {icon} `{price_data['p1h']:+.2f}%` ({val_1h})\n"
-        
+    
     if price_data.get('p24h') is not None:
         icon = '🟢' if price_data['p24h'] >= 0 else '🔴'
         val_24h = format_price(price_data.get('price_24h', 0)) if price_data.get('price_24h') else 'N/A'
@@ -550,8 +552,6 @@ async def get_token_report(symbol: str) -> str:
     msg += "──────────────────────\n"
     msg += f"📈 KL giao dịch 24h: `${price_data['vol']:,.0f}`\n"
     
-    cg_info = await cg_task
-
     if cg_info:
         msg += "══════════════════════\n"
         msg += "📋 **THÔNG TIN THỊ TRƯỜNG**\n"
@@ -603,37 +603,29 @@ async def get_token_report(symbol: str) -> str:
     
     if prediction:
         msg += "══════════════════════\n"
-        msg += f"🔮 **DỰ ĐOÁN XU HƯỚNG**\n"
-        msg += f"──────────────────────\n"
+        msg += "🔮 **DỰ ĐOÁN XU HƯỚNG**\n"
+        msg += "──────────────────────\n"
         msg += f"📊 Xu hướng: {prediction['trend_icon']} **{prediction['trend']}**\n"
         msg += f"📈 Độ tin cậy: `{prediction['confidence']:.1f}%`\n"
-        msg += f"──────────────────────\n"
+        msg += "──────────────────────\n"
         msg += f"├ Tín hiệu Tăng: `{prediction['bullish_score']:.1f}%`\n"
         msg += f"└ Tín hiệu Giảm: `{prediction['bearish_score']:.1f}%`\n"
-        msg += f"──────────────────────\n"
+        msg += "──────────────────────\n"
         msg += "🎯 **MỤC TIÊU GIÁ (24h)**\n"
-        msg += f"🟢 **Nếu TĂNG:**\n"
-        msg += f"├ Mục tiêu: `{format_price(prediction['target_high'])}`\n"
-        msg += f"└ % Tăng: `+{prediction['target_pct_high']:.2f}%`\n"
-        msg += f"🔴 **Nếu GIẢM:**\n"
-        msg += f"├ Mục tiêu: `{format_price(prediction['target_low'])}`\n"
-        msg += f"└ % Giảm: `-{prediction['target_pct_low']:.2f}%`\n"
-        msg += f"──────────────────────\n"
+        msg += f"🟢 Nếu TĂNG: `{format_price(prediction['target_high'])}` (+{prediction['target_pct_high']:.2f}%)\n"
+        msg += f"🔴 Nếu GIẢM: `{format_price(prediction['target_low'])}` (-{prediction['target_pct_low']:.2f}%)\n"
+        msg += "──────────────────────\n"
         msg += f"💡 **Gợi ý:** {prediction['recommendation']}\n"
     
     # Disclaimer
     msg += "══════════════════════\n"
-    msg += "⚠️ **CẢNH BÁO** ⚠️\n"
-    msg += "```\n"
-    msg += "🚨 ĐÂY CHỈ LÀ DỰ ĐOÁN!\n"
-    msg += "CHÚNG TÔI KHÔNG CHỊU\n"
-    msg += "TRÁCH NHIỆM MẤT MÁT!\n"
+    msg += "⚠️ **CẢNH BÁO:** Đây chỉ là dự đoán!\n"
+    msg += "Chúng tôi không chịu trách nhiệm mất mát.\n"
     msg += "Hãy DYOR!\n"
-    msg += "```\n"
     msg += "══════════════════════\n"
     msg += f"🕐 `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`"
     
-    price_cache[cache_key] = msg
+    set_cached(cache_key, msg)
     return msg
 
 
@@ -671,11 +663,12 @@ async def get_chart_image_from_api(symbol: str, interval: str = '1h', theme: str
                 buf = io.BytesIO(image_data)
                 buf.seek(0)
                 return buf, f"BINANCE:{symbol_upper}USDT"
-    except:
+    except Exception:
         pass
     
     for exchange in ['BYBIT', 'OKX', 'COINBASE']:
         try:
+            session = await get_http_session()
             alt_url = (
                 f"https://api.chart-img.com/v1/tradingview/advanced-chart?"
                 f"symbol={exchange}:{symbol_upper}USDT"
@@ -690,7 +683,7 @@ async def get_chart_image_from_api(symbol: str, interval: str = '1h', theme: str
                     buf = io.BytesIO(image_data)
                     buf.seek(0)
                     return buf, f"{exchange}:{symbol_upper}USDT"
-        except:
+        except Exception:
             continue
     
     return None, None
@@ -739,12 +732,16 @@ async def generate_ccxt_chart(symbol: str, interval: str, theme: str = 'light') 
                         savefig=dict(fname=buf, dpi=100, pad_inches=0.25)
                     )
                     buf.seek(0)
+                    await ex.close()
                     return buf, f"{ex.name}: {pair}"
-        except:
+        except Exception:
             pass
         finally:
             if ex:
-                await ex.close()
+                try:
+                    await ex.close()
+                except Exception:
+                    pass
     
     return None, None
 
@@ -752,8 +749,8 @@ async def generate_ccxt_chart(symbol: str, interval: str, theme: str = 'light') 
 async def generate_coingecko_chart(coin_id: str, interval: str, theme: str = 'light') -> tuple[io.BytesIO | None, str | None]:
     """Generate a candlestick chart using CoinGecko OHLC data."""
     days = '1' if interval in ['5m', '15m', '1h', '4h'] else '90'
-        url = f"{COINGECKO_API_URL}/coins/{coin_id}/ohlc?vs_currency=usd&days={days}"
-        
+    url = f"{COINGECKO_API_URL}/coins/{coin_id}/ohlc?vs_currency=usd&days={days}"
+    
     data = await fetch_json(url, timeout=10)
     if not data:
         return None, None
@@ -790,7 +787,7 @@ async def generate_coingecko_chart(coin_id: str, interval: str, theme: str = 'li
         )
         buf.seek(0)
         return buf, coin_id.upper()
-    except:
+    except Exception:
         return None, None
 
 
@@ -804,8 +801,8 @@ async def get_buy_sell_vol(symbol: str, interval: str) -> str:
     tf = tf_map.get(interval)
     limit = 3 if interval == '3h' else 1
     
-        pair = f"{symbol.upper()}USDT"
-        url = f"{BINANCE_API_URL}/klines?symbol={pair}&interval={tf}&limit={limit}"
+    pair = f"{symbol.upper()}USDT"
+    url = f"{BINANCE_API_URL}/klines?symbol={pair}&interval={tf}&limit={limit}"
     
     klines = await fetch_json(url, timeout=10)
     if not klines:
@@ -832,7 +829,7 @@ async def get_buy_sell_vol(symbol: str, interval: str) -> str:
             f"🔴 Bán: `{format_price(sell)}` ({100-pct:.1f}%)\n"
             f"⚖️ Ròng: `{format_price(net)}` {symbol.upper()}"
         )
-    except:
+    except Exception:
         return "Lỗi phân tích volume."
 
 
@@ -843,16 +840,18 @@ async def get_buy_sell_vol(symbol: str, interval: str) -> str:
 async def get_current_price(symbol: str) -> tuple[float | None, str | None]:
     """Get current price quickly."""
     cache_key = f"price_{symbol.lower()}"
-    if cache_key in price_cache:
-        return price_cache[cache_key]
+    cached = get_cached(cache_key, ttl=10)
+    if cached:
+        return cached
     
     for stable in ['USDT', 'USDC']:
         url = f"{BINANCE_API_URL}/ticker/price?symbol={symbol.upper()}{stable}"
         data = await fetch_json(url, timeout=3)
         if data and 'price' in data:
             price = float(data['price'])
-            price_cache[cache_key] = (price, "Binance")
-            return price, "Binance"
+            result = (price, "Binance")
+            set_cached(cache_key, result)
+            return result
     
     for ex_id in ['gateio', 'mexc']:
         ex = None
@@ -860,25 +859,29 @@ async def get_current_price(symbol: str) -> tuple[float | None, str | None]:
             ex = getattr(ccxt, ex_id)({'timeout': 5000})
             for s in STABLES:
                 try:
-                t = await ex.fetch_ticker(f"{symbol.upper()}/{s}")
-                if t and t.get('last'): 
+                    t = await ex.fetch_ticker(f"{symbol.upper()}/{s}")
+                    if t and t.get('last'):
                         result = (t['last'], ex.name)
-                        price_cache[cache_key] = result
+                        set_cached(cache_key, result)
+                        await ex.close()
                         return result
-                except:
+                except Exception:
                     continue
-        except:
+        except Exception:
             pass
         finally:
             if ex:
+                try:
                     await ex.close()
+                except Exception:
+                    pass
     
     cid = await get_coingecko_id(symbol)
     if cid:
         data = await fetch_json(f"{COINGECKO_API_URL}/simple/price?ids={cid}&vs_currencies=usd")
         if data and data.get(cid, {}).get('usd'):
             result = (float(data[cid]['usd']), "CoinGecko")
-            price_cache[cache_key] = result
+            set_cached(cache_key, result)
             return result
     
     return None, "Không tìm thấy giá."
@@ -911,41 +914,42 @@ async def get_volume_data(symbol: str, date_str: str = None) -> str:
             data = await fetch_json(f"{COINGECKO_API_URL}/coins/{cid}/history?date={dt}", timeout=10)
             if data:
                 vol = data.get('market_data', {}).get('total_volume', {}).get('usd')
-            return f"📊 **Vol {symbol.upper()} ngày {date_str}:** `${int(vol):,}`" if vol else "Không có dữ liệu."
+                return f"📊 **Vol {symbol.upper()} ngày {date_str}:** `${int(vol):,}`" if vol else "Không có dữ liệu."
         else:
             data = await fetch_json(f"{COINGECKO_API_URL}/coins/{cid}/market_chart?vs_currency=usd&days=max&interval=daily", timeout=10)
             if data:
                 vols = data.get('total_volumes', [])
-            total = sum(x[1] for x in vols)
-            return f"📊 **Tổng Vol Tích Lũy {symbol.upper()}:** `${int(total):,}`"
-    except:
+                total = sum(x[1] for x in vols)
+                return f"📊 **Tổng Vol Tích Lũy {symbol.upper()}:** `${int(total):,}`"
+    except Exception:
         pass
     return "Lỗi dữ liệu."
 
 
 async def get_trending() -> str:
     """Get trending cryptocurrencies from CoinGecko."""
-    cache_key = "trending"
-    if cache_key in market_cache:
-        return market_cache[cache_key]
+    cached = get_cached("trending", ttl=60)
+    if cached:
+        return cached
     
     data = await fetch_json(f"{COINGECKO_API_URL}/search/trending", timeout=10)
     if not data:
         return "Lỗi trending."
     
-        msg = "🔥 **Trending:**\n"
+    msg = "🔥 **Trending:**\n"
     for i, c in enumerate(data.get('coins', [])[:7]):
         msg += f"{i+1}. {c['item']['symbol']}\n"
     
-    market_cache[cache_key] = msg
-        return msg
+    set_cached("trending", msg)
+    return msg
 
 
 async def get_market(order: str, limit: int = 10) -> str:
     """Get top gainers or losers from CoinGecko."""
     cache_key = f"market_{order}"
-    if cache_key in market_cache:
-        return market_cache[cache_key]
+    cached = get_cached(cache_key, ttl=60)
+    if cached:
+        return cached
     
     sort = 'price_change_percentage_24h_desc' if order == 'gainers' else 'price_change_percentage_24h_asc'
     url = f"{COINGECKO_API_URL}/coins/markets?vs_currency=usd&order={sort}&per_page={limit}"
@@ -954,12 +958,13 @@ async def get_market(order: str, limit: int = 10) -> str:
     if not data:
         return "Lỗi market data."
     
-        msg = f"📊 **Top {order.title()}**\n"
+    msg = f"📊 **Top {order.title()}**\n"
     for c in data:
-        msg += f"{c['symbol'].upper()}: {format_price(c['current_price'])} ({c['price_change_percentage_24h']:+.2f}%)\n"
+        change = c.get('price_change_percentage_24h', 0) or 0
+        msg += f"{c['symbol'].upper()}: {format_price(c['current_price'])} ({change:+.2f}%)\n"
     
-    market_cache[cache_key] = msg
-        return msg
+    set_cached(cache_key, msg)
+    return msg
 
 
 # ==============================================================================
@@ -1040,20 +1045,26 @@ async def chart_cmd(update, context):
     
     # Fallback to local CCXT generation
     if not buf:
-        await context.bot.edit_message_text(
-            chat_id=msg.chat.id,
-            message_id=wait.message_id,
-            text=f"⏳ Đang vẽ chart {sym}..."
-        )
-    buf, name = await generate_ccxt_chart(sym, tf, theme)
+        try:
+            await context.bot.edit_message_text(
+                chat_id=msg.chat.id,
+                message_id=wait.message_id,
+                text=f"⏳ Đang vẽ chart {sym}..."
+            )
+        except Exception:
+            pass
+        buf, name = await generate_ccxt_chart(sym, tf, theme)
     
     # Fallback to CoinGecko
-    if not buf: 
+    if not buf:
         cid = await get_coingecko_id(sym)
         if cid:
             buf, name = await generate_coingecko_chart(cid, tf, theme)
     
-    await context.bot.delete_message(msg.chat.id, wait.message_id)
+    try:
+        await context.bot.delete_message(msg.chat.id, wait.message_id)
+    except Exception:
+        pass
     
     if buf:
         await msg.reply_photo(buf, caption=f"📊 {name} | {tf}")
@@ -1080,12 +1091,15 @@ async def vol_analysis_handler(update, context):
     
     wait = await msg.reply_text(f"⏳ Phân tích vol {sym} {tf}...")
     res = await get_buy_sell_vol(sym, tf)
-    await context.bot.edit_message_text(
-        chat_id=msg.chat.id,
-        message_id=wait.message_id,
-        text=res,
-        parse_mode=ParseMode.MARKDOWN
-    )
+    try:
+        await context.bot.edit_message_text(
+            chat_id=msg.chat.id,
+            message_id=wait.message_id,
+            text=res,
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception:
+        await msg.reply_text(res, parse_mode=ParseMode.MARKDOWN)
 
 
 async def calculate_cmd(update, context):
@@ -1106,7 +1120,7 @@ async def calculate_cmd(update, context):
     symbol = parts[1]
     try:
         amount = float(parts[2])
-    except:
+    except ValueError:
         await msg.reply_text("⚠️ Số lượng không hợp lệ!", parse_mode=ParseMode.MARKDOWN)
         return
     
@@ -1118,20 +1132,23 @@ async def calculate_cmd(update, context):
         res = (
             f"💰 **Kết quả tính toán**\n"
             f"--------------------\n"
-               f"💵 **Giá:** `{format_price(p)}` / {symbol.upper()}\n"
-               f"🔢 **SL:** `{amount:g}`\n"
+            f"💵 **Giá:** `{format_price(p)}` / {symbol.upper()}\n"
+            f"🔢 **SL:** `{amount:g}`\n"
             f"--------------------\n"
             f"💎 **Tổng:** `{format_price(total)}`"
         )
     else:
         res = f"😕 Không tìm thấy giá {symbol.upper()}."
     
-    await context.bot.edit_message_text(
-        chat_id=msg.chat.id,
-        message_id=wait.message_id,
-        text=res,
-        parse_mode=ParseMode.MARKDOWN
-    )
+    try:
+        await context.bot.edit_message_text(
+            chat_id=msg.chat.id,
+            message_id=wait.message_id,
+            text=res,
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception:
+        await msg.reply_text(res, parse_mode=ParseMode.MARKDOWN)
 
 
 async def vol_cmd(update, context):
@@ -1154,12 +1171,15 @@ async def vol_cmd(update, context):
     
     wait = await msg.reply_text("⏳ Check vol...")
     res = await get_volume_data(sym, date_str)
-    await context.bot.edit_message_text(
-        chat_id=msg.chat.id,
-        message_id=wait.message_id,
-        text=res,
-        parse_mode=ParseMode.MARKDOWN
-    )
+    try:
+        await context.bot.edit_message_text(
+            chat_id=msg.chat.id,
+            message_id=wait.message_id,
+            text=res,
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception:
+        await msg.reply_text(res, parse_mode=ParseMode.MARKDOWN)
 
 
 async def trending_cmd(update, context):
@@ -1199,7 +1219,8 @@ async def value_cmd(update, context):
     if txt.startswith('/'):
         txt = txt[1:]
     
-    expr = txt.split(maxsplit=1)[1] if len(txt.split()) > 1 else ""
+    parts = txt.split(maxsplit=1)
+    expr = parts[1] if len(parts) > 1 else ""
     
     if not expr:
         await msg.reply_text("⚠️ Dùng: `val <biểu thức>`\nVí dụ: `val 100 * 2.5 + 50`", parse_mode=ParseMode.MARKDOWN)
@@ -1232,11 +1253,11 @@ async def handle_msg(update, context):
     txt = msg.text.strip()
     txt_normalized = normalize_command(txt)
     txt_norm_lower = txt_normalized.lower()
-
+    
     # Volume analysis: [/]<coin> <timeframe>
     if re.match(r'^[a-zA-Z0-9]{2,10}\s+(15m|1h|3h|4h|24h)$', txt_normalized, re.IGNORECASE):
         return await vol_analysis_handler(update, context)
-
+    
     # Chart command: [/]ch <symbol>
     if txt_norm_lower.startswith('ch '):
         return await chart_cmd(update, context)
@@ -1292,7 +1313,7 @@ async def handle_msg(update, context):
             res = await get_token_report(sym)
             await msg.reply_text(res, parse_mode=ParseMode.MARKDOWN)
         return
-
+    
     # Contract address lookup
     if is_contract_address(txt):
         res = await get_dex_data(txt)
