@@ -67,12 +67,8 @@ STABLES = ['USDT', 'USDC', 'FDUSD', 'USD']
 # ==============================================================================
 # USER ACTIVITY LOGGING
 # ==============================================================================
-
-# Determine log file path - use current working directory
-LOG_DIR = Path(os.getcwd())
-USER_LOG_FILE = LOG_DIR / "user_activity.csv"
+USER_LOG_FILE = "user_activity.csv"
 _log_lock = threading.Lock()
-_log_initialized = False
 
 # CSV columns for user activity log
 LOG_COLUMNS = [
@@ -95,26 +91,12 @@ LOG_COLUMNS = [
 
 def init_log_file():
     """Initialize CSV log file with headers if it doesn't exist."""
-    global _log_initialized
-    
-    try:
-        log_path = Path(USER_LOG_FILE)
-        print(f"[LOG] Checking log file at: {log_path.absolute()}")
-        
-        if not log_path.exists():
-            print(f"[LOG] Creating new log file...")
-            with open(log_path, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                writer.writerow(LOG_COLUMNS)
-            print(f"[LOG] ✅ Created user activity log file: {log_path.absolute()}")
-        else:
-            print(f"[LOG] Log file already exists: {log_path.absolute()}")
-        
-        _log_initialized = True
-        return True
-    except Exception as e:
-        print(f"[LOG] ❌ Error initializing log file: {e}")
-        return False
+    log_path = Path(USER_LOG_FILE)
+    if not log_path.exists():
+        with open(log_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(LOG_COLUMNS)
+        print(f"Created user activity log file: {USER_LOG_FILE}")
 
 
 def log_user_activity(
@@ -133,14 +115,9 @@ def log_user_activity(
     error_message: str = None
 ):
     """Log user activity to CSV file."""
-    global _log_initialized
-    
     try:
         # Ensure log file exists
-        if not _log_initialized:
-            if not init_log_file():
-                print("[LOG] ⚠️ Skipping log - file not initialized")
-                return
+        init_log_file()
         
         # Get VN timezone timestamp
         vn_now = datetime.now(timezone(timedelta(hours=7)))
@@ -170,16 +147,14 @@ def log_user_activity(
                 writer = csv.writer(f)
                 writer.writerow(row)
         
-        # Print to console for Railway logs
-        log_msg = f"[LOG] ✅ User: {username or user_id} | Cmd: {command} | Symbol: {symbol or 'N/A'} | Status: {status}"
+        # Also print to console for Railway logs
+        log_msg = f"[{timestamp}] User: {username or user_id} | Cmd: {command} | Symbol: {symbol or 'N/A'} | Status: {status}"
         if response_time_ms:
             log_msg += f" | Time: {response_time_ms:.0f}ms"
         print(log_msg)
         
     except Exception as e:
-        print(f"[LOG] ❌ Error logging user activity: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"Error logging user activity: {e}")
 
 
 def extract_user_info(update: Update) -> dict:
@@ -1087,28 +1062,286 @@ async def get_dex_data(address: str) -> str:
     )
 
 
+async def get_today_volume_binance(symbol: str) -> dict | None:
+    """
+    Lấy volume từ 00:00 UTC hôm nay đến hiện tại từ Binance.
+    Sử dụng klines 1h để tính chính xác.
+    """
+    symbol_upper = symbol.upper()
+    
+    # Tính thời gian 00:00 UTC hôm nay (milliseconds)
+    now_utc = datetime.now(timezone.utc)
+    start_of_day_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_time_ms = int(start_of_day_utc.timestamp() * 1000)
+    end_time_ms = int(now_utc.timestamp() * 1000)
+    
+    # Số giờ từ 00:00 UTC đến hiện tại
+    hours_elapsed = (now_utc - start_of_day_utc).total_seconds() / 3600
+    
+    for stable in ['USDT', 'USDC', 'FDUSD']:
+        pair = f"{symbol_upper}{stable}"
+        
+        # Lấy klines 1h từ 00:00 UTC đến hiện tại
+        url = f"{BINANCE_API_URL}/klines?symbol={pair}&interval=1h&startTime={start_time_ms}&endTime={end_time_ms}"
+        klines = await fetch_json(url, timeout=10)
+        
+        if klines and len(klines) > 0:
+            # Tính tổng volume
+            total_base_vol = sum(float(k[5]) for k in klines)  # Base asset volume
+            total_quote_vol = sum(float(k[7]) for k in klines)  # Quote asset volume (USD)
+            total_buy_vol = sum(float(k[9]) for k in klines)  # Taker buy base volume
+            total_buy_quote = sum(float(k[10]) for k in klines)  # Taker buy quote volume
+            
+            # Tính giá trung bình
+            avg_price = total_quote_vol / total_base_vol if total_base_vol > 0 else 0
+            
+            # Lấy giá mở đầu ngày và giá hiện tại
+            open_price = float(klines[0][1])  # Open của candle đầu tiên
+            close_price = float(klines[-1][4])  # Close của candle cuối
+            
+            # Tính thay đổi giá trong ngày
+            price_change = ((close_price - open_price) / open_price * 100) if open_price > 0 else 0
+            
+            # High và Low trong ngày
+            high_price = max(float(k[2]) for k in klines)
+            low_price = min(float(k[3]) for k in klines)
+            
+            return {
+                'symbol': symbol_upper,
+                'pair': f"{symbol_upper}/{stable}",
+                'source': 'Binance',
+                'total_volume': total_base_vol,
+                'total_volume_usd': total_quote_vol,
+                'buy_volume': total_buy_vol,
+                'buy_volume_usd': total_buy_quote,
+                'sell_volume': total_base_vol - total_buy_vol,
+                'sell_volume_usd': total_quote_vol - total_buy_quote,
+                'avg_price': avg_price,
+                'open_price': open_price,
+                'close_price': close_price,
+                'high_price': high_price,
+                'low_price': low_price,
+                'price_change': price_change,
+                'hours_elapsed': hours_elapsed,
+                'num_candles': len(klines),
+                'start_time': start_of_day_utc,
+                'end_time': now_utc,
+            }
+    
+    return None
+
+
+async def get_today_volume_ccxt(symbol: str) -> dict | None:
+    """Lấy volume từ 00:00 UTC hôm nay đến hiện tại từ CCXT exchanges."""
+    symbol_upper = symbol.upper()
+    
+    now_utc = datetime.now(timezone.utc)
+    start_of_day_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_time_ms = int(start_of_day_utc.timestamp() * 1000)
+    
+    hours_elapsed = (now_utc - start_of_day_utc).total_seconds() / 3600
+    
+    for ex_id in ['gateio', 'mexc', 'kucoin']:
+        async with CCXTExchange(ex_id, timeout=10000) as ex:
+            if ex is None:
+                continue
+            
+            try:
+                await ex.load_markets()
+                
+                for stable in STABLES:
+                    pair = f"{symbol_upper}/{stable}"
+                    if pair not in ex.markets:
+                        continue
+                    
+                    # Lấy OHLCV từ 00:00 UTC
+                    ohlcv = await ex.fetch_ohlcv(pair, timeframe='1h', since=start_time_ms, limit=25)
+                    
+                    if ohlcv and len(ohlcv) > 0:
+                        total_base_vol = sum(candle[5] for candle in ohlcv)
+                        
+                        # Tính quote volume (base vol * price)
+                        total_quote_vol = sum(candle[5] * ((candle[1] + candle[4]) / 2) for candle in ohlcv)
+                        
+                        open_price = ohlcv[0][1]
+                        close_price = ohlcv[-1][4]
+                        high_price = max(candle[2] for candle in ohlcv)
+                        low_price = min(candle[3] for candle in ohlcv)
+                        price_change = ((close_price - open_price) / open_price * 100) if open_price > 0 else 0
+                        
+                        return {
+                            'symbol': symbol_upper,
+                            'pair': pair,
+                            'source': ex.name,
+                            'total_volume': total_base_vol,
+                            'total_volume_usd': total_quote_vol,
+                            'buy_volume': 0,  # CCXT không có dữ liệu này
+                            'buy_volume_usd': 0,
+                            'sell_volume': 0,
+                            'sell_volume_usd': 0,
+                            'avg_price': total_quote_vol / total_base_vol if total_base_vol > 0 else 0,
+                            'open_price': open_price,
+                            'close_price': close_price,
+                            'high_price': high_price,
+                            'low_price': low_price,
+                            'price_change': price_change,
+                            'hours_elapsed': hours_elapsed,
+                            'num_candles': len(ohlcv),
+                            'start_time': start_of_day_utc,
+                            'end_time': now_utc,
+                        }
+            except Exception:
+                continue
+    
+    return None
+
+
+async def get_today_volume(symbol: str) -> str:
+    """
+    Lấy volume từ 00:00 UTC hôm nay đến thời điểm hiện tại.
+    Ưu tiên Binance, fallback sang CCXT exchanges.
+    """
+    symbol_upper = symbol.upper()
+    
+    # Cache key
+    cache_key = f"today_vol_{symbol_upper}"
+    cached = get_cached(cache_key, ttl=60)  # Cache 1 phút
+    if cached:
+        return cached
+    
+    # Thử Binance trước
+    vol_data = await get_today_volume_binance(symbol)
+    
+    # Fallback sang CCXT
+    if not vol_data:
+        vol_data = await get_today_volume_ccxt(symbol)
+    
+    if not vol_data:
+        return f"❌ Không tìm thấy dữ liệu volume cho **{symbol_upper}**."
+    
+    # Format output
+    now_utc = datetime.now(timezone.utc)
+    vn_now = now_utc.astimezone(timezone(timedelta(hours=7)))
+    
+    total_vol = vol_data['total_volume']
+    total_vol_usd = vol_data['total_volume_usd']
+    buy_vol = vol_data.get('buy_volume', 0)
+    buy_vol_usd = vol_data.get('buy_volume_usd', 0)
+    sell_vol = vol_data.get('sell_volume', 0)
+    sell_vol_usd = vol_data.get('sell_volume_usd', 0)
+    hours = vol_data['hours_elapsed']
+    price_change = vol_data['price_change']
+    source = vol_data['source']
+    pair = vol_data['pair']
+    
+    # Tính % buy/sell
+    buy_pct = (buy_vol / total_vol * 100) if total_vol > 0 else 0
+    sell_pct = 100 - buy_pct
+    
+    # Icon thay đổi giá
+    price_icon = '📈' if price_change >= 0 else '📉'
+    
+    # Trạng thái buy/sell
+    if buy_vol > 0:
+        if buy_pct > 55:
+            state = "🟢 **MUA ÁP ĐẢO**"
+        elif buy_pct > 50:
+            state = "🟢 MUA > BÁN"
+        elif buy_pct > 45:
+            state = "🔴 BÁN > MUA"
+        else:
+            state = "🔴 **BÁN ÁP ĐẢO**"
+    else:
+        state = "📊 Không có dữ liệu Buy/Sell"
+    
+    # Format volume
+    def fmt_vol(v):
+        if v >= 1_000_000_000:
+            return f"${v/1_000_000_000:,.2f}B"
+        elif v >= 1_000_000:
+            return f"${v/1_000_000:,.2f}M"
+        elif v >= 1_000:
+            return f"${v/1_000:,.2f}K"
+        return f"${v:,.2f}"
+    
+    def fmt_token(v, sym):
+        if v >= 1_000_000_000:
+            return f"{v/1_000_000_000:,.2f}B {sym}"
+        elif v >= 1_000_000:
+            return f"{v/1_000_000:,.2f}M {sym}"
+        elif v >= 1_000:
+            return f"{v/1_000:,.2f}K {sym}"
+        return f"{v:,.2f} {sym}"
+    
+    msg = f"""
+📊 **VOLUME HÔM NAY - {symbol_upper}**
+══════════════════════════════
+📍 Nguồn: `{source}` | Cặp: `{pair}`
+⏰ Từ: `00:00 UTC` → `{now_utc.strftime('%H:%M')} UTC`
+⏱️ Thời gian: `{hours:.1f} giờ` ({vol_data['num_candles']} candles)
+══════════════════════════════
+
+💰 **GIÁ TRONG NGÀY**
+├ Mở cửa: `{format_price(vol_data['open_price'])}`
+├ Hiện tại: `{format_price(vol_data['close_price'])}` {price_icon} `{price_change:+.2f}%`
+├ Cao nhất: `{format_price(vol_data['high_price'])}`
+└ Thấp nhất: `{format_price(vol_data['low_price'])}`
+
+📈 **VOLUME GIAO DỊCH**
+├ Tổng Vol: `{fmt_token(total_vol, symbol_upper)}`
+└ Tổng USD: `{fmt_vol(total_vol_usd)}`
+"""
+    
+    # Thêm phân tích Buy/Sell nếu có dữ liệu
+    if buy_vol > 0:
+        net_vol = buy_vol - sell_vol
+        net_vol_usd = buy_vol_usd - sell_vol_usd
+        
+        msg += f"""
+──────────────────────────────
+{state}
+├ 🟢 Mua: `{fmt_token(buy_vol, symbol_upper)}` ({buy_pct:.1f}%)
+│   └ USD: `{fmt_vol(buy_vol_usd)}`
+├ 🔴 Bán: `{fmt_token(sell_vol, symbol_upper)}` ({sell_pct:.1f}%)
+│   └ USD: `{fmt_vol(sell_vol_usd)}`
+└ ⚖️ Ròng: `{fmt_token(abs(net_vol), symbol_upper)}` {'🟢' if net_vol >= 0 else '🔴'}
+    └ USD: `{fmt_vol(abs(net_vol_usd))}`
+"""
+    
+    msg += f"""
+══════════════════════════════
+🕐 `{vn_now.strftime('%Y-%m-%d %H:%M:%S')} (UTC+7)`
+"""
+    
+    set_cached(cache_key, msg)
+    return msg
+
+
 async def get_volume_data(symbol: str, date_str: str = None) -> str:
-    """Get volume data from CoinGecko."""
+    """Get volume data - today's volume or historical."""
+    # Nếu không có date_str, lấy volume hôm nay
+    if not date_str:
+        return await get_today_volume(symbol)
+    
+    # Lấy volume theo ngày cụ thể từ CoinGecko
     cid = await get_coingecko_id(symbol)
     if not cid:
         return "❌ Không tìm thấy coin."
     
     try:
-        if date_str:
-            dt = datetime.strptime(date_str, '%Y%m%d').strftime('%d-%m-%Y')
-            data = await fetch_json(f"{COINGECKO_API_URL}/coins/{cid}/history?date={dt}", timeout=10)
-            if data:
-                vol = data.get('market_data', {}).get('total_volume', {}).get('usd')
-                return f"📊 **Vol {symbol.upper()} ngày {date_str}:** `${int(vol):,}`" if vol else "Không có dữ liệu."
-        else:
-            data = await fetch_json(f"{COINGECKO_API_URL}/coins/{cid}/market_chart?vs_currency=usd&days=max&interval=daily", timeout=10)
-            if data:
-                vols = data.get('total_volumes', [])
-                total = sum(x[1] for x in vols)
-                return f"📊 **Tổng Vol Tích Lũy {symbol.upper()}:** `${int(total):,}`"
+        dt = datetime.strptime(date_str, '%Y%m%d').strftime('%d-%m-%Y')
+        data = await fetch_json(f"{COINGECKO_API_URL}/coins/{cid}/history?date={dt}", timeout=10)
+        if data:
+            vol = data.get('market_data', {}).get('total_volume', {}).get('usd')
+            if vol:
+                return f"📊 **Vol {symbol.upper()} ngày {date_str}:** `${int(vol):,}`"
+            return "Không có dữ liệu volume cho ngày này."
+    except ValueError:
+        return "⚠️ Định dạng ngày không hợp lệ. Dùng: `YYYYMMDD`"
     except Exception:
         pass
-    return "Lỗi dữ liệu."
+    
+    return "Lỗi khi lấy dữ liệu."
 
 
 async def get_trending() -> str:
@@ -1728,9 +1961,13 @@ async def start_cmd(update, context):
 └ `ch btc 1d dark` - Chart ngày, nền tối
 
 📉 **PHÂN TÍCH VOLUME**
-├ `btc 1h` hoặc `/btc 1h` - Vol 1 giờ
-├ `eth 15m` - Vol 15 phút
-└ `sol 24h` - Vol 24 giờ
+├ `btc 1h` hoặc `/btc 1h` - Buy/Sell 1 giờ
+├ `eth 15m` - Buy/Sell 15 phút
+└ `sol 24h` - Buy/Sell 24 giờ
+
+📊 **VOLUME HÔM NAY**
+├ `vol btc` - Vol từ 00:00 UTC đến hiện tại
+└ `vol eth 20241230` - Vol ngày cụ thể
 
 🧮 **TÍNH TOÁN**
 ├ `cal btc 0.5` - Tính giá trị 0.5 BTC
@@ -1740,7 +1977,6 @@ async def start_cmd(update, context):
 ├ `trending` - Coin trending
 ├ `buy` - Top tăng giá
 ├ `sell` - Top giảm giá
-├ `vol btc` - Volume tích lũy
 ├ `compe` - Alpha Competition list
 └ `alpha` - Alpha Daily Report
 
@@ -2181,28 +2417,17 @@ async def handle_msg(update, context):
 
 def main():
     """Initialize and run the Telegram bot."""
-    print("=" * 50)
-    print("🤖 CRYPTO TELEGRAM BOT - Starting...")
-    print("=" * 50)
-    
-    # Print working directory
-    print(f"[INFO] Working directory: {os.getcwd()}")
-    print(f"[INFO] Log file path: {USER_LOG_FILE}")
+    print("Bot starting...")
     
     # Initialize user activity log file
-    if init_log_file():
-        print(f"[INFO] ✅ User activity logging enabled")
-    else:
-        print(f"[INFO] ⚠️ User activity logging failed to initialize")
+    init_log_file()
+    print(f"User activity logging enabled: {USER_LOG_FILE}")
     
     # Build and run the bot
-    print("[INFO] Building Telegram bot application...")
     app = Application.builder().token(BOT_TOKEN).connect_timeout(30).read_timeout(60).build()
     app.add_handler(MessageHandler(filters.TEXT | filters.COMMAND, handle_msg))
     
-    print("=" * 50)
-    print("🚀 Bot started successfully!")
-    print("=" * 50)
+    print("Bot started successfully!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
