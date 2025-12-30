@@ -67,8 +67,12 @@ STABLES = ['USDT', 'USDC', 'FDUSD', 'USD']
 # ==============================================================================
 # USER ACTIVITY LOGGING
 # ==============================================================================
-USER_LOG_FILE = "user_activity.csv"
+
+# Determine log file path - use current working directory
+LOG_DIR = Path(os.getcwd())
+USER_LOG_FILE = LOG_DIR / "user_activity.csv"
 _log_lock = threading.Lock()
+_log_initialized = False
 
 # CSV columns for user activity log
 LOG_COLUMNS = [
@@ -91,12 +95,26 @@ LOG_COLUMNS = [
 
 def init_log_file():
     """Initialize CSV log file with headers if it doesn't exist."""
-    log_path = Path(USER_LOG_FILE)
-    if not log_path.exists():
-        with open(log_path, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow(LOG_COLUMNS)
-        print(f"Created user activity log file: {USER_LOG_FILE}")
+    global _log_initialized
+    
+    try:
+        log_path = Path(USER_LOG_FILE)
+        print(f"[LOG] Checking log file at: {log_path.absolute()}")
+        
+        if not log_path.exists():
+            print(f"[LOG] Creating new log file...")
+            with open(log_path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(LOG_COLUMNS)
+            print(f"[LOG] ✅ Created user activity log file: {log_path.absolute()}")
+        else:
+            print(f"[LOG] Log file already exists: {log_path.absolute()}")
+        
+        _log_initialized = True
+        return True
+    except Exception as e:
+        print(f"[LOG] ❌ Error initializing log file: {e}")
+        return False
 
 
 def log_user_activity(
@@ -115,9 +133,14 @@ def log_user_activity(
     error_message: str = None
 ):
     """Log user activity to CSV file."""
+    global _log_initialized
+    
     try:
         # Ensure log file exists
-        init_log_file()
+        if not _log_initialized:
+            if not init_log_file():
+                print("[LOG] ⚠️ Skipping log - file not initialized")
+                return
         
         # Get VN timezone timestamp
         vn_now = datetime.now(timezone(timedelta(hours=7)))
@@ -147,14 +170,16 @@ def log_user_activity(
                 writer = csv.writer(f)
                 writer.writerow(row)
         
-        # Also print to console for Railway logs
-        log_msg = f"[{timestamp}] User: {username or user_id} | Cmd: {command} | Symbol: {symbol or 'N/A'} | Status: {status}"
+        # Print to console for Railway logs
+        log_msg = f"[LOG] ✅ User: {username or user_id} | Cmd: {command} | Symbol: {symbol or 'N/A'} | Status: {status}"
         if response_time_ms:
             log_msg += f" | Time: {response_time_ms:.0f}ms"
         print(log_msg)
         
     except Exception as e:
-        print(f"Error logging user activity: {e}")
+        print(f"[LOG] ❌ Error logging user activity: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 def extract_user_info(update: Update) -> dict:
@@ -2156,17 +2181,28 @@ async def handle_msg(update, context):
 
 def main():
     """Initialize and run the Telegram bot."""
-    print("Bot starting...")
+    print("=" * 50)
+    print("🤖 CRYPTO TELEGRAM BOT - Starting...")
+    print("=" * 50)
+    
+    # Print working directory
+    print(f"[INFO] Working directory: {os.getcwd()}")
+    print(f"[INFO] Log file path: {USER_LOG_FILE}")
     
     # Initialize user activity log file
-    init_log_file()
-    print(f"User activity logging enabled: {USER_LOG_FILE}")
+    if init_log_file():
+        print(f"[INFO] ✅ User activity logging enabled")
+    else:
+        print(f"[INFO] ⚠️ User activity logging failed to initialize")
     
     # Build and run the bot
+    print("[INFO] Building Telegram bot application...")
     app = Application.builder().token(BOT_TOKEN).connect_timeout(30).read_timeout(60).build()
     app.add_handler(MessageHandler(filters.TEXT | filters.COMMAND, handle_msg))
     
-    print("Bot started successfully!")
+    print("=" * 50)
+    print("🚀 Bot started successfully!")
+    print("=" * 50)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
