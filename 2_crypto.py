@@ -17,10 +17,13 @@ import aiohttp
 import io
 import re
 import os
+import csv
+import threading
 import pandas as pd
 import mplfinance as mpf
 import ccxt.async_support as ccxt
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters
 from telegram.constants import ParseMode
@@ -60,6 +63,156 @@ DEXSCREENER_API_URL = "https://api.dexscreener.com/latest/dex"
 PRIORITY_EXCHANGES = ['binance', 'bybit', 'okx', 'gateio', 'mexc', 'kucoin']
 VALID_SYMBOL_PATTERN = re.compile(r'^[a-zA-Z0-9]{1,10}$')
 STABLES = ['USDT', 'USDC', 'FDUSD', 'USD']
+
+# ==============================================================================
+# USER ACTIVITY LOGGING
+# ==============================================================================
+USER_LOG_FILE = "user_activity.csv"
+_log_lock = threading.Lock()
+
+# CSV columns for user activity log
+LOG_COLUMNS = [
+    'timestamp',           # Thời gian (UTC+7)
+    'user_id',             # Telegram user ID
+    'username',            # Telegram username
+    'first_name',          # Tên người dùng
+    'last_name',           # Họ người dùng
+    'chat_id',             # Chat ID
+    'chat_type',           # Loại chat (private, group, supergroup, channel)
+    'chat_title',          # Tên group/channel (nếu có)
+    'command',             # Lệnh đã dùng (p, ch, compe, etc.)
+    'full_message',        # Tin nhắn đầy đủ
+    'symbol',              # Symbol token (nếu có)
+    'response_time_ms',    # Thời gian phản hồi (ms)
+    'status',              # Trạng thái (success, error)
+    'error_message',       # Thông báo lỗi (nếu có)
+]
+
+
+def init_log_file():
+    """Initialize CSV log file with headers if it doesn't exist."""
+    log_path = Path(USER_LOG_FILE)
+    if not log_path.exists():
+        with open(log_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(LOG_COLUMNS)
+        print(f"Created user activity log file: {USER_LOG_FILE}")
+
+
+def log_user_activity(
+    user_id: int = None,
+    username: str = None,
+    first_name: str = None,
+    last_name: str = None,
+    chat_id: int = None,
+    chat_type: str = None,
+    chat_title: str = None,
+    command: str = None,
+    full_message: str = None,
+    symbol: str = None,
+    response_time_ms: float = None,
+    status: str = 'success',
+    error_message: str = None
+):
+    """Log user activity to CSV file."""
+    try:
+        # Ensure log file exists
+        init_log_file()
+        
+        # Get VN timezone timestamp
+        vn_now = datetime.now(timezone(timedelta(hours=7)))
+        timestamp = vn_now.strftime('%Y-%m-%d %H:%M:%S')
+        
+        # Prepare row data
+        row = [
+            timestamp,
+            user_id or '',
+            username or '',
+            first_name or '',
+            last_name or '',
+            chat_id or '',
+            chat_type or '',
+            chat_title or '',
+            command or '',
+            full_message or '',
+            symbol or '',
+            f"{response_time_ms:.2f}" if response_time_ms else '',
+            status,
+            error_message or ''
+        ]
+        
+        # Thread-safe write to CSV
+        with _log_lock:
+            with open(USER_LOG_FILE, 'a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(row)
+        
+        # Also print to console for Railway logs
+        log_msg = f"[{timestamp}] User: {username or user_id} | Cmd: {command} | Symbol: {symbol or 'N/A'} | Status: {status}"
+        if response_time_ms:
+            log_msg += f" | Time: {response_time_ms:.0f}ms"
+        print(log_msg)
+        
+    except Exception as e:
+        print(f"Error logging user activity: {e}")
+
+
+def extract_user_info(update: Update) -> dict:
+    """Extract user information from Telegram update."""
+    msg = update.message or update.channel_post
+    
+    user_info = {
+        'user_id': None,
+        'username': None,
+        'first_name': None,
+        'last_name': None,
+        'chat_id': None,
+        'chat_type': None,
+        'chat_title': None,
+    }
+    
+    if msg:
+        user_info['chat_id'] = msg.chat.id
+        user_info['chat_type'] = msg.chat.type
+        user_info['chat_title'] = getattr(msg.chat, 'title', None)
+        
+        if msg.from_user:
+            user_info['user_id'] = msg.from_user.id
+            user_info['username'] = msg.from_user.username
+            user_info['first_name'] = msg.from_user.first_name
+            user_info['last_name'] = msg.from_user.last_name
+    
+    return user_info
+
+
+def extract_command_and_symbol(text: str) -> tuple[str, str]:
+    """Extract command and symbol from message text."""
+    if not text:
+        return '', ''
+    
+    text = text.strip()
+    if text.startswith('/'):
+        text = text[1:]
+    
+    parts = text.split()
+    if not parts:
+        return '', ''
+    
+    cmd = parts[0].lower()
+    
+    # Extract symbol based on command type
+    symbol = ''
+    if cmd in ['p', 'ath', 'ch', 'cal', 'vol'] and len(parts) > 1:
+        symbol = parts[1].upper()
+    elif text.startswith('$') and len(text) > 1:
+        cmd = 'price_quick'
+        symbol = text[1:].upper()
+    elif re.match(r'^[a-zA-Z0-9]{2,10}\s+(15m|1h|3h|4h|24h)$', text, re.IGNORECASE):
+        cmd = 'vol_analysis'
+        symbol = parts[0].upper()
+    
+    return cmd, symbol
+
 
 # ==============================================================================
 # SIMPLE CACHING (without cachetools dependency)
@@ -1855,84 +2008,146 @@ async def handle_msg(update, context):
     if not msg or not msg.text:
         return
     
+    # Start timing for response time calculation
+    start_time = datetime.now()
+    
+    # Extract user info for logging
+    user_info = extract_user_info(update)
+    
     txt = msg.text.strip()
     txt_normalized = normalize_command(txt)
     txt_norm_lower = txt_normalized.lower()
     
-    # Volume analysis: [/]<coin> <timeframe>
-    if re.match(r'^[a-zA-Z0-9]{2,10}\s+(15m|1h|3h|4h|24h)$', txt_normalized, re.IGNORECASE):
-        return await vol_analysis_handler(update, context)
+    # Extract command and symbol for logging
+    command, symbol = extract_command_and_symbol(txt)
     
-    # Chart command: [/]ch <symbol>
-    if txt_norm_lower.startswith('ch '):
-        return await chart_cmd(update, context)
+    # Log helper function
+    def do_log(status='success', error_msg=None):
+        response_time = (datetime.now() - start_time).total_seconds() * 1000
+        log_user_activity(
+            user_id=user_info['user_id'],
+            username=user_info['username'],
+            first_name=user_info['first_name'],
+            last_name=user_info['last_name'],
+            chat_id=user_info['chat_id'],
+            chat_type=user_info['chat_type'],
+            chat_title=user_info['chat_title'],
+            command=command,
+            full_message=txt[:200],  # Limit message length
+            symbol=symbol,
+            response_time_ms=response_time,
+            status=status,
+            error_message=error_msg
+        )
     
-    # Start/Help command: [/]start
-    if txt_norm_lower == 'start' or txt_norm_lower.startswith('start '):
-        return await start_cmd(update, context)
-    
-    # Price report command: [/]p <symbol>
-    if txt_norm_lower.startswith('p '):
-        parts = txt_normalized.split()
-        if len(parts) > 1:
-            res = await get_token_report(parts[1])
+    try:
+        # Volume analysis: [/]<coin> <timeframe>
+        if re.match(r'^[a-zA-Z0-9]{2,10}\s+(15m|1h|3h|4h|24h)$', txt_normalized, re.IGNORECASE):
+            await vol_analysis_handler(update, context)
+            do_log()
+            return
+        
+        # Chart command: [/]ch <symbol>
+        if txt_norm_lower.startswith('ch '):
+            await chart_cmd(update, context)
+            do_log()
+            return
+        
+        # Start/Help command: [/]start
+        if txt_norm_lower == 'start' or txt_norm_lower.startswith('start '):
+            await start_cmd(update, context)
+            do_log()
+            return
+        
+        # Price report command: [/]p <symbol>
+        if txt_norm_lower.startswith('p '):
+            parts = txt_normalized.split()
+            if len(parts) > 1:
+                res = await get_token_report(parts[1])
+                await msg.reply_text(res, parse_mode=ParseMode.MARKDOWN)
+            do_log()
+            return
+        
+        # ATH command: [/]ath <symbol>
+        if txt_norm_lower.startswith('ath '):
+            parts = txt_normalized.split()
+            if len(parts) > 1:
+                res = await get_token_report(parts[1])
+                await msg.reply_text(res, parse_mode=ParseMode.MARKDOWN)
+            do_log()
+            return
+        
+        # Calculator command: [/]cal <symbol> <amount>
+        if txt_norm_lower.startswith('cal '):
+            await calculate_cmd(update, context)
+            do_log()
+            return
+        
+        # Value/Math expression command: [/]val <expression>
+        if txt_norm_lower.startswith('val '):
+            await value_cmd(update, context)
+            do_log()
+            return
+        
+        # Trending command: [/]trending
+        if txt_norm_lower == 'trending' or txt_norm_lower.startswith('trending '):
+            await trending_cmd(update, context)
+            do_log()
+            return
+        
+        # Buy (top gainers) command: [/]buy
+        if txt_norm_lower == 'buy' or txt_norm_lower.startswith('buy '):
+            await buy_cmd(update, context)
+            do_log()
+            return
+        
+        # Sell (top losers) command: [/]sell
+        if txt_norm_lower == 'sell' or txt_norm_lower.startswith('sell '):
+            await sell_cmd(update, context)
+            do_log()
+            return
+        
+        # Competition command: [/]compe
+        if txt_norm_lower == 'compe' or txt_norm_lower.startswith('compe '):
+            await compe_cmd(update, context)
+            do_log()
+            return
+        
+        # Alpha daily report command: [/]alpha
+        if txt_norm_lower == 'alpha' or txt_norm_lower.startswith('alpha '):
+            await alpha_cmd(update, context)
+            do_log()
+            return
+        
+        # Volume command: [/]vol <symbol>
+        if txt_norm_lower.startswith('vol '):
+            await vol_cmd(update, context)
+            do_log()
+            return
+        
+        # Quick price lookup with $ prefix
+        if txt.startswith('$') and len(txt) > 1:
+            sym = txt[1:]
+            if VALID_SYMBOL_PATTERN.match(sym):
+                res = await get_token_report(sym)
+                await msg.reply_text(res, parse_mode=ParseMode.MARKDOWN)
+                do_log()
+            return
+        
+        # Contract address lookup
+        if is_contract_address(txt):
+            res = await get_dex_data(txt)
+            if res == "NOT_FOUND":
+                res = "❌ Không tìm thấy contract."
             await msg.reply_text(res, parse_mode=ParseMode.MARKDOWN)
-        return
-    
-    # ATH command: [/]ath <symbol>
-    if txt_norm_lower.startswith('ath '):
-        parts = txt_normalized.split()
-        if len(parts) > 1:
-            res = await get_token_report(parts[1])
-            await msg.reply_text(res, parse_mode=ParseMode.MARKDOWN)
-        return
-    
-    # Calculator command: [/]cal <symbol> <amount>
-    if txt_norm_lower.startswith('cal '):
-        return await calculate_cmd(update, context)
-    
-    # Value/Math expression command: [/]val <expression>
-    if txt_norm_lower.startswith('val '):
-        return await value_cmd(update, context)
-    
-    # Trending command: [/]trending
-    if txt_norm_lower == 'trending' or txt_norm_lower.startswith('trending '):
-        return await trending_cmd(update, context)
-    
-    # Buy (top gainers) command: [/]buy
-    if txt_norm_lower == 'buy' or txt_norm_lower.startswith('buy '):
-        return await buy_cmd(update, context)
-    
-    # Sell (top losers) command: [/]sell
-    if txt_norm_lower == 'sell' or txt_norm_lower.startswith('sell '):
-        return await sell_cmd(update, context)
-    
-    # Competition command: [/]compe
-    if txt_norm_lower == 'compe' or txt_norm_lower.startswith('compe '):
-        return await compe_cmd(update, context)
-    
-    # Alpha daily report command: [/]alpha
-    if txt_norm_lower == 'alpha' or txt_norm_lower.startswith('alpha '):
-        return await alpha_cmd(update, context)
-    
-    # Volume command: [/]vol <symbol>
-    if txt_norm_lower.startswith('vol '):
-        return await vol_cmd(update, context)
-    
-    # Quick price lookup with $ prefix
-    if txt.startswith('$') and len(txt) > 1:
-        sym = txt[1:]
-        if VALID_SYMBOL_PATTERN.match(sym):
-            res = await get_token_report(sym)
-            await msg.reply_text(res, parse_mode=ParseMode.MARKDOWN)
-        return
-    
-    # Contract address lookup
-    if is_contract_address(txt):
-        res = await get_dex_data(txt)
-        if res == "NOT_FOUND":
-            res = "❌ Không tìm thấy contract."
-        await msg.reply_text(res, parse_mode=ParseMode.MARKDOWN)
+            do_log()
+            return
+        
+        # No command matched - don't log non-command messages
+        
+    except Exception as e:
+        do_log(status='error', error_msg=str(e)[:200])
+        raise
 
 
 # ==============================================================================
@@ -1941,10 +2156,17 @@ async def handle_msg(update, context):
 
 def main():
     """Initialize and run the Telegram bot."""
-    print("Bot started...")
+    print("Bot starting...")
     
+    # Initialize user activity log file
+    init_log_file()
+    print(f"User activity logging enabled: {USER_LOG_FILE}")
+    
+    # Build and run the bot
     app = Application.builder().token(BOT_TOKEN).connect_timeout(30).read_timeout(60).build()
     app.add_handler(MessageHandler(filters.TEXT | filters.COMMAND, handle_msg))
+    
+    print("Bot started successfully!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
