@@ -1131,67 +1131,66 @@ async def get_today_volume_binance(symbol: str) -> dict | None:
     return None
 
 
-async def get_today_volume_ccxt(symbol: str) -> dict | None:
-    """Lấy volume từ 00:00 UTC hôm nay đến hiện tại từ CCXT exchanges."""
+async def get_today_volume_dexscreener(symbol: str) -> dict | None:
+    """
+    Lấy volume từ DexScreener cho Binance Alpha tokens.
+    DexScreener có thể có dữ liệu cho các token chưa list trên Binance Spot.
+    """
     symbol_upper = symbol.upper()
     
     now_utc = datetime.now(timezone.utc)
     start_of_day_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
-    start_time_ms = int(start_of_day_utc.timestamp() * 1000)
-    
     hours_elapsed = (now_utc - start_of_day_utc).total_seconds() / 3600
     
-    for ex_id in ['gateio', 'mexc', 'kucoin']:
-        async with CCXTExchange(ex_id, timeout=10000) as ex:
-            if ex is None:
-                continue
+    try:
+        url = f"{DEXSCREENER_API_URL}/search?q={symbol_upper}"
+        data = await fetch_json(url, timeout=10)
+        
+        if data and data.get('pairs'):
+            # Lọc chỉ lấy pairs trên BSC (Binance Smart Chain) hoặc có liquidity cao
+            pairs = [p for p in data['pairs'] if p.get('baseToken', {}).get('symbol', '').upper() == symbol_upper]
             
-            try:
-                await ex.load_markets()
+            # Ưu tiên BSC pairs
+            bsc_pairs = [p for p in pairs if p.get('chainId') == 'bsc']
+            if bsc_pairs:
+                pairs = bsc_pairs
+            
+            if pairs:
+                # Lấy pair có liquidity cao nhất
+                best_pair = max(pairs, key=lambda x: x.get('liquidity', {}).get('usd', 0))
                 
-                for stable in STABLES:
-                    pair = f"{symbol_upper}/{stable}"
-                    if pair not in ex.markets:
-                        continue
-                    
-                    # Lấy OHLCV từ 00:00 UTC
-                    ohlcv = await ex.fetch_ohlcv(pair, timeframe='1h', since=start_time_ms, limit=25)
-                    
-                    if ohlcv and len(ohlcv) > 0:
-                        total_base_vol = sum(candle[5] for candle in ohlcv)
-                        
-                        # Tính quote volume (base vol * price)
-                        total_quote_vol = sum(candle[5] * ((candle[1] + candle[4]) / 2) for candle in ohlcv)
-                        
-                        open_price = ohlcv[0][1]
-                        close_price = ohlcv[-1][4]
-                        high_price = max(candle[2] for candle in ohlcv)
-                        low_price = min(candle[3] for candle in ohlcv)
-                        price_change = ((close_price - open_price) / open_price * 100) if open_price > 0 else 0
-                        
-                        return {
-                            'symbol': symbol_upper,
-                            'pair': pair,
-                            'source': ex.name,
-                            'total_volume': total_base_vol,
-                            'total_volume_usd': total_quote_vol,
-                            'buy_volume': 0,  # CCXT không có dữ liệu này
-                            'buy_volume_usd': 0,
-                            'sell_volume': 0,
-                            'sell_volume_usd': 0,
-                            'avg_price': total_quote_vol / total_base_vol if total_base_vol > 0 else 0,
-                            'open_price': open_price,
-                            'close_price': close_price,
-                            'high_price': high_price,
-                            'low_price': low_price,
-                            'price_change': price_change,
-                            'hours_elapsed': hours_elapsed,
-                            'num_candles': len(ohlcv),
-                            'start_time': start_of_day_utc,
-                            'end_time': now_utc,
-                        }
-            except Exception:
-                continue
+                price = float(best_pair.get('priceUsd', 0))
+                vol_24h = best_pair.get('volume', {}).get('h24', 0) or 0
+                price_change = best_pair.get('priceChange', {}).get('h24', 0) or 0
+                
+                # Ước tính volume từ 00:00 UTC (tỷ lệ với số giờ đã qua)
+                estimated_today_vol = vol_24h * (hours_elapsed / 24) if hours_elapsed > 0 else 0
+                
+                return {
+                    'symbol': symbol_upper,
+                    'pair': f"{best_pair['baseToken']['symbol']}/{best_pair['quoteToken']['symbol']}",
+                    'source': f"Binance Alpha (DEX: {best_pair.get('dexId', 'unknown')})",
+                    'total_volume': estimated_today_vol / price if price > 0 else 0,
+                    'total_volume_usd': estimated_today_vol,
+                    'buy_volume': 0,
+                    'buy_volume_usd': 0,
+                    'sell_volume': 0,
+                    'sell_volume_usd': 0,
+                    'avg_price': price,
+                    'open_price': price / (1 + price_change/100) if price_change != -100 else price,
+                    'close_price': price,
+                    'high_price': 0,
+                    'low_price': 0,
+                    'price_change': price_change,
+                    'hours_elapsed': hours_elapsed,
+                    'num_candles': 0,
+                    'start_time': start_of_day_utc,
+                    'end_time': now_utc,
+                    'is_estimated': True,
+                    'chain': best_pair.get('chainId', 'unknown'),
+                }
+    except Exception:
+        pass
     
     return None
 
@@ -1199,7 +1198,7 @@ async def get_today_volume_ccxt(symbol: str) -> dict | None:
 async def get_today_volume(symbol: str) -> str:
     """
     Lấy volume từ 00:00 UTC hôm nay đến thời điểm hiện tại.
-    Ưu tiên Binance, fallback sang CCXT exchanges.
+    Chỉ lấy từ Binance Spot/Futures và Binance Alpha (DexScreener BSC).
     """
     symbol_upper = symbol.upper()
     
@@ -1209,12 +1208,12 @@ async def get_today_volume(symbol: str) -> str:
     if cached:
         return cached
     
-    # Thử Binance trước
+    # Thử Binance Spot/Futures trước
     vol_data = await get_today_volume_binance(symbol)
     
-    # Fallback sang CCXT
+    # Nếu không có trên Binance, thử DexScreener (cho Binance Alpha tokens)
     if not vol_data:
-        vol_data = await get_today_volume_ccxt(symbol)
+        vol_data = await get_today_volume_dexscreener(symbol)
     
     if not vol_data:
         return f"❌ Không tìm thấy dữ liệu volume cho **{symbol_upper}**."
@@ -1273,21 +1272,51 @@ async def get_today_volume(symbol: str) -> str:
             return f"{v/1_000:,.2f}K {sym}"
         return f"{v:,.2f} {sym}"
     
+    # Check if this is estimated data (Binance Alpha)
+    is_estimated = vol_data.get('is_estimated', False)
+    chain = vol_data.get('chain', '')
+    
     msg = f"""
 📊 **VOLUME HÔM NAY - {symbol_upper}**
 ══════════════════════════════
-📍 Nguồn: `{source}` | Cặp: `{pair}`
+📍 Nguồn: `{source}`
+├ Cặp: `{pair}`"""
+    
+    if chain:
+        msg += f"\n├ Chain: `{chain.upper()}`"
+    
+    msg += f"""
 ⏰ Từ: `00:00 UTC` → `{now_utc.strftime('%H:%M')} UTC`
-⏱️ Thời gian: `{hours:.1f} giờ` ({vol_data['num_candles']} candles)
+⏱️ Thời gian: `{hours:.1f} giờ`"""
+    
+    if vol_data['num_candles'] > 0:
+        msg += f" ({vol_data['num_candles']} candles)"
+    
+    msg += """
 ══════════════════════════════
 
-💰 **GIÁ TRONG NGÀY**
-├ Mở cửa: `{format_price(vol_data['open_price'])}`
-├ Hiện tại: `{format_price(vol_data['close_price'])}` {price_icon} `{price_change:+.2f}%`
-├ Cao nhất: `{format_price(vol_data['high_price'])}`
-└ Thấp nhất: `{format_price(vol_data['low_price'])}`
+💰 **GIÁ TRONG NGÀY**"""
+    
+    if vol_data['open_price'] > 0:
+        msg += f"\n├ Mở cửa: `{format_price(vol_data['open_price'])}`"
+    
+    msg += f"\n├ Hiện tại: `{format_price(vol_data['close_price'])}` {price_icon} `{price_change:+.2f}%`"
+    
+    if vol_data['high_price'] > 0:
+        msg += f"\n├ Cao nhất: `{format_price(vol_data['high_price'])}`"
+    if vol_data['low_price'] > 0:
+        msg += f"\n└ Thấp nhất: `{format_price(vol_data['low_price'])}`"
+    else:
+        msg += "\n└ (Dữ liệu High/Low không khả dụng)"
+    
+    msg += f"""
 
-📈 **VOLUME GIAO DỊCH**
+📈 **VOLUME GIAO DỊCH**"""
+    
+    if is_estimated:
+        msg += " _(ước tính)_"
+    
+    msg += f"""
 ├ Tổng Vol: `{fmt_token(total_vol, symbol_upper)}`
 └ Tổng USD: `{fmt_vol(total_vol_usd)}`
 """
