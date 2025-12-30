@@ -112,6 +112,35 @@ async def close_http_session():
         _http_session = None
 
 
+async def safe_close_exchange(exchange):
+    """Safely close a CCXT exchange connection."""
+    if exchange is not None:
+        try:
+            await exchange.close()
+        except Exception:
+            pass
+
+
+class CCXTExchange:
+    """Context manager for safe CCXT exchange usage."""
+    
+    def __init__(self, exchange_id: str, timeout: int = 5000):
+        self.exchange_id = exchange_id
+        self.timeout = timeout
+        self.exchange = None
+    
+    async def __aenter__(self):
+        try:
+            self.exchange = getattr(ccxt, self.exchange_id)({'timeout': self.timeout})
+            return self.exchange
+        except Exception:
+            return None
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await safe_close_exchange(self.exchange)
+        return False  # Don't suppress exceptions
+
+
 # ==============================================================================
 # HELPER FUNCTIONS
 # ==============================================================================
@@ -302,9 +331,9 @@ async def get_ccxt_price(symbol: str) -> tuple[dict | None, str, str]:
     symbol_upper = symbol.upper()
     
     for ex_id in ['gateio', 'mexc', 'kucoin', 'okx', 'bybit']:
-        ex = None
-        try:
-            ex = getattr(ccxt, ex_id)({'timeout': 5000})
+        async with CCXTExchange(ex_id, timeout=5000) as ex:
+            if ex is None:
+                continue
             
             for stable in STABLES:
                 try:
@@ -319,18 +348,9 @@ async def get_ccxt_price(symbol: str) -> tuple[dict | None, str, str]:
                             'vol': t.get('quoteVolume', 0),
                             'vol_unit': 'USDT'
                         }
-                        await ex.close()
                         return result, f"Sàn {ex.name}", t['symbol']
                 except Exception:
                     continue
-        except Exception:
-            pass
-        finally:
-            if ex:
-                try:
-                    await ex.close()
-                except Exception:
-                    pass
     
     return None, "", ""
 
@@ -694,54 +714,49 @@ async def generate_ccxt_chart(symbol: str, interval: str, theme: str = 'light') 
     print(f"Drawing chart {symbol} {interval}...")
     
     for ex_id in PRIORITY_EXCHANGES:
-        ex = None
-        try:
-            ex = getattr(ccxt, ex_id)({'timeout': 10000})
-            await ex.load_markets()
+        async with CCXTExchange(ex_id, timeout=10000) as ex:
+            if ex is None:
+                continue
             
-            for s in STABLES:
-                pair = f"{symbol.upper()}/{s}"
-                if pair in ex.markets:
-                    ohlcv = await ex.fetch_ohlcv(pair, timeframe=interval, limit=100)
-                    if not ohlcv:
-                        continue
-                    
-                    df = pd.DataFrame(ohlcv, columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume'])
-                    df['Date'] = pd.to_datetime(df['Date'], unit='ms')
-                    df = df.set_index('Date')
-                    
-                    mc = mpf.make_marketcolors(
-                        up='#0ECB81',
-                        down='#F6465D',
-                        inherit=True
-                    )
-                    
-                    s_style = mpf.make_mpf_style(
-                        base_mpf_style='yahoo' if theme == 'light' else 'nightclouds',
-                        marketcolors=mc,
-                        y_on_right=True
-                    )
-                    
-                    buf = io.BytesIO()
-                    mpf.plot(
-                        df,
-                        type='candle',
-                        style=s_style,
-                        title=f'\n{ex.name}: {pair} - {interval}',
-                        volume=True,
-                        savefig=dict(fname=buf, dpi=100, pad_inches=0.25)
-                    )
-                    buf.seek(0)
-                    await ex.close()
-                    return buf, f"{ex.name}: {pair}"
-        except Exception:
-            pass
-        finally:
-            if ex:
-                try:
-                    await ex.close()
-                except Exception:
-                    pass
+            try:
+                await ex.load_markets()
+                
+                for s in STABLES:
+                    pair = f"{symbol.upper()}/{s}"
+                    if pair in ex.markets:
+                        ohlcv = await ex.fetch_ohlcv(pair, timeframe=interval, limit=100)
+                        if not ohlcv:
+                            continue
+                        
+                        df = pd.DataFrame(ohlcv, columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume'])
+                        df['Date'] = pd.to_datetime(df['Date'], unit='ms')
+                        df = df.set_index('Date')
+                        
+                        mc = mpf.make_marketcolors(
+                            up='#0ECB81',
+                            down='#F6465D',
+                            inherit=True
+                        )
+                        
+                        s_style = mpf.make_mpf_style(
+                            base_mpf_style='yahoo' if theme == 'light' else 'nightclouds',
+                            marketcolors=mc,
+                            y_on_right=True
+                        )
+                        
+                        buf = io.BytesIO()
+                        mpf.plot(
+                            df,
+                            type='candle',
+                            style=s_style,
+                            title=f'\n{ex.name}: {pair} - {interval}',
+                            volume=True,
+                            savefig=dict(fname=buf, dpi=100, pad_inches=0.25)
+                        )
+                        buf.seek(0)
+                        return buf, f"{ex.name}: {pair}"
+            except Exception:
+                continue
     
     return None, None
 
@@ -854,27 +869,19 @@ async def get_current_price(symbol: str) -> tuple[float | None, str | None]:
             return result
     
     for ex_id in ['gateio', 'mexc']:
-        ex = None
-        try:
-            ex = getattr(ccxt, ex_id)({'timeout': 5000})
+        async with CCXTExchange(ex_id, timeout=5000) as ex:
+            if ex is None:
+                continue
+            
             for s in STABLES:
                 try:
                     t = await ex.fetch_ticker(f"{symbol.upper()}/{s}")
                     if t and t.get('last'):
                         result = (t['last'], ex.name)
                         set_cached(cache_key, result)
-                        await ex.close()
                         return result
                 except Exception:
                     continue
-        except Exception:
-            pass
-        finally:
-            if ex:
-                try:
-                    await ex.close()
-                except Exception:
-                    pass
     
     cid = await get_coingecko_id(symbol)
     if cid:
@@ -1092,14 +1099,15 @@ async def get_token_price_from_sources(symbol: str) -> dict | None:
     
     # 3. Thử CCXT exchanges (Gate.io, MEXC, KuCoin)
     for ex_id in ['gateio', 'mexc', 'kucoin']:
-        ex = None
-        try:
-            ex = getattr(ccxt, ex_id)({'timeout': 5000})
+        async with CCXTExchange(ex_id, timeout=5000) as ex:
+            if ex is None:
+                continue
+            
             for stable in STABLES:
                 try:
                     ticker = await ex.fetch_ticker(f"{symbol_upper}/{stable}")
                     if ticker and ticker.get('last'):
-                        result = {
+                        return {
                             'price': ticker['last'],
                             'volume_24h': ticker.get('quoteVolume', 0) or 0,
                             'price_change_24h': ticker.get('percentage', 0) or 0,
@@ -1108,18 +1116,8 @@ async def get_token_price_from_sources(symbol: str) -> dict | None:
                             'source': ex.name,
                             'pair': f"{symbol_upper}/{stable}"
                         }
-                        await ex.close()
-                        return result
                 except Exception:
                     continue
-        except Exception:
-            pass
-        finally:
-            if ex:
-                try:
-                    await ex.close()
-                except Exception:
-                    pass
     
     # 4. Thử DexScreener
     try:
