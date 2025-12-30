@@ -1131,74 +1131,65 @@ async def get_today_volume_binance(symbol: str) -> dict | None:
     return None
 
 
-async def get_today_volume_dexscreener(symbol: str) -> dict | None:
+async def get_alpha_token_volume(symbol: str) -> dict | None:
     """
-    Lấy volume từ DexScreener cho Binance Alpha tokens.
-    DexScreener có thể có dữ liệu cho các token chưa list trên Binance Spot.
+    Lấy volume giao dịch Binance Alpha từ dữ liệu đã lưu.
+    Đây là volume giao dịch của users trên Binance Alpha program.
     """
     symbol_upper = symbol.upper()
+    
+    # Check if token is in ACTIVE_ALPHA_TOKENS
+    if symbol_upper not in ACTIVE_ALPHA_TOKENS:
+        return None
+    
+    token_info = ACTIVE_ALPHA_TOKENS[symbol_upper]
+    if token_info.get('status') != 'active':
+        return None
     
     now_utc = datetime.now(timezone.utc)
     start_of_day_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
     hours_elapsed = (now_utc - start_of_day_utc).total_seconds() / 3600
     
-    try:
-        url = f"{DEXSCREENER_API_URL}/search?q={symbol_upper}"
-        data = await fetch_json(url, timeout=10)
-        
-        if data and data.get('pairs'):
-            # Lọc chỉ lấy pairs trên BSC (Binance Smart Chain) hoặc có liquidity cao
-            pairs = [p for p in data['pairs'] if p.get('baseToken', {}).get('symbol', '').upper() == symbol_upper]
-            
-            # Ưu tiên BSC pairs
-            bsc_pairs = [p for p in pairs if p.get('chainId') == 'bsc']
-            if bsc_pairs:
-                pairs = bsc_pairs
-            
-            if pairs:
-                # Lấy pair có liquidity cao nhất
-                best_pair = max(pairs, key=lambda x: x.get('liquidity', {}).get('usd', 0))
-                
-                price = float(best_pair.get('priceUsd', 0))
-                vol_24h = best_pair.get('volume', {}).get('h24', 0) or 0
-                price_change = best_pair.get('priceChange', {}).get('h24', 0) or 0
-                
-                # Ước tính volume từ 00:00 UTC (tỷ lệ với số giờ đã qua)
-                estimated_today_vol = vol_24h * (hours_elapsed / 24) if hours_elapsed > 0 else 0
-                
-                return {
-                    'symbol': symbol_upper,
-                    'pair': f"{best_pair['baseToken']['symbol']}/{best_pair['quoteToken']['symbol']}",
-                    'source': f"Binance Alpha (DEX: {best_pair.get('dexId', 'unknown')})",
-                    'total_volume': estimated_today_vol / price if price > 0 else 0,
-                    'total_volume_usd': estimated_today_vol,
-                    'buy_volume': 0,
-                    'buy_volume_usd': 0,
-                    'sell_volume': 0,
-                    'sell_volume_usd': 0,
-                    'avg_price': price,
-                    'open_price': price / (1 + price_change/100) if price_change != -100 else price,
-                    'close_price': price,
-                    'high_price': 0,
-                    'low_price': 0,
-                    'price_change': price_change,
-                    'hours_elapsed': hours_elapsed,
-                    'num_candles': 0,
-                    'start_time': start_of_day_utc,
-                    'end_time': now_utc,
-                    'is_estimated': True,
-                    'chain': best_pair.get('chainId', 'unknown'),
-                }
-    except Exception:
-        pass
+    # Lấy giá hiện tại từ nhiều nguồn
+    price_info = await get_token_price_from_sources(symbol)
+    price = price_info['price'] if price_info else 0
+    price_change = price_info.get('price_change_24h', 0) if price_info else 0
     
-    return None
+    # Lấy daily volume từ ACTIVE_ALPHA_TOKENS (cập nhật thủ công từ Market Health)
+    daily_vol = token_info.get('daily_vol', 0)
+    campaign_vol = token_info.get('campaign_vol', token_info.get('total_vol', 0))
+    
+    return {
+        'symbol': symbol_upper,
+        'pair': f"{symbol_upper}/USDT",
+        'source': 'Binance Alpha',
+        'total_volume': daily_vol / price if price > 0 else 0,
+        'total_volume_usd': daily_vol,
+        'buy_volume': 0,
+        'buy_volume_usd': 0,
+        'sell_volume': 0,
+        'sell_volume_usd': 0,
+        'avg_price': price,
+        'open_price': price / (1 + price_change/100) if price_change and price_change != -100 else price,
+        'close_price': price,
+        'high_price': 0,
+        'low_price': 0,
+        'price_change': price_change or 0,
+        'hours_elapsed': hours_elapsed,
+        'num_candles': 0,
+        'start_time': start_of_day_utc,
+        'end_time': now_utc,
+        'is_alpha': True,
+        'min_vol': token_info.get('min_vol', 0),
+        'campaign_vol': campaign_vol,
+        'reward_tokens': token_info.get('reward_tokens', 0),
+    }
 
 
 async def get_today_volume(symbol: str) -> str:
     """
     Lấy volume từ 00:00 UTC hôm nay đến thời điểm hiện tại.
-    Chỉ lấy từ Binance Spot/Futures và Binance Alpha (DexScreener BSC).
+    Chỉ lấy từ Binance Spot/Futures và Binance Alpha.
     """
     symbol_upper = symbol.upper()
     
@@ -1211,9 +1202,9 @@ async def get_today_volume(symbol: str) -> str:
     # Thử Binance Spot/Futures trước
     vol_data = await get_today_volume_binance(symbol)
     
-    # Nếu không có trên Binance, thử DexScreener (cho Binance Alpha tokens)
+    # Nếu không có trên Binance Spot, thử Binance Alpha tokens
     if not vol_data:
-        vol_data = await get_today_volume_dexscreener(symbol)
+        vol_data = await get_alpha_token_volume(symbol)
     
     if not vol_data:
         return f"❌ Không tìm thấy dữ liệu volume cho **{symbol_upper}**."
@@ -1272,7 +1263,8 @@ async def get_today_volume(symbol: str) -> str:
             return f"{v/1_000:,.2f}K {sym}"
         return f"{v:,.2f} {sym}"
     
-    # Check if this is estimated data (Binance Alpha)
+    # Check if this is Binance Alpha token
+    is_alpha = vol_data.get('is_alpha', False)
     is_estimated = vol_data.get('is_estimated', False)
     chain = vol_data.get('chain', '')
     
@@ -1295,34 +1287,49 @@ async def get_today_volume(symbol: str) -> str:
     msg += """
 ══════════════════════════════
 
-💰 **GIÁ TRONG NGÀY**"""
+💰 **GIÁ HIỆN TẠI**"""
     
-    if vol_data['open_price'] > 0:
+    if vol_data['open_price'] > 0 and not is_alpha:
         msg += f"\n├ Mở cửa: `{format_price(vol_data['open_price'])}`"
     
-    msg += f"\n├ Hiện tại: `{format_price(vol_data['close_price'])}` {price_icon} `{price_change:+.2f}%`"
+    msg += f"\n├ Giá: `{format_price(vol_data['close_price'])}` {price_icon} `{price_change:+.2f}%`"
     
     if vol_data['high_price'] > 0:
         msg += f"\n├ Cao nhất: `{format_price(vol_data['high_price'])}`"
     if vol_data['low_price'] > 0:
         msg += f"\n└ Thấp nhất: `{format_price(vol_data['low_price'])}`"
-    else:
+    elif not is_alpha:
         msg += "\n└ (Dữ liệu High/Low không khả dụng)"
     
-    msg += f"""
+    # Binance Alpha specific info
+    if is_alpha:
+        min_vol = vol_data.get('min_vol', 0)
+        campaign_vol = vol_data.get('campaign_vol', 0)
+        reward_tokens = vol_data.get('reward_tokens', 0)
+        
+        msg += f"""
+
+📈 **BINANCE ALPHA VOLUME**
+├ Daily Vol: `{fmt_vol(total_vol_usd)}`
+├ Min Vol: `{fmt_vol(min_vol)}`
+├ Campaign Vol: `{fmt_vol(campaign_vol)}`
+└ Reward: `{fmt_token(reward_tokens, symbol_upper)}`
+"""
+    else:
+        msg += f"""
 
 📈 **VOLUME GIAO DỊCH**"""
-    
-    if is_estimated:
-        msg += " _(ước tính)_"
-    
-    msg += f"""
+        
+        if is_estimated:
+            msg += " _(ước tính)_"
+        
+        msg += f"""
 ├ Tổng Vol: `{fmt_token(total_vol, symbol_upper)}`
 └ Tổng USD: `{fmt_vol(total_vol_usd)}`
 """
     
-    # Thêm phân tích Buy/Sell nếu có dữ liệu
-    if buy_vol > 0:
+    # Thêm phân tích Buy/Sell nếu có dữ liệu (chỉ Binance Spot)
+    if buy_vol > 0 and not is_alpha:
         net_vol = buy_vol - sell_vol
         net_vol_usd = buy_vol_usd - sell_vol_usd
         
@@ -1431,57 +1438,85 @@ BINANCE_ALPHA_API = "https://www.binance.com/bapi/alpha/v1"
 # total_vol: Tổng volume hiện tại của competition ($)
 # vol_change: Thay đổi volume ($)
 # end_time: Thời gian kết thúc (UTC) format "YYYY-MM-DD HH:MM"
+# Danh sách token Alpha đang active trên Binance (cập nhật thủ công từ Market Health)
+# daily_vol: Volume giao dịch trong ngày trên Binance Alpha
+# campaign_vol: Tổng volume campaign (Camp. Vol trong Market Health)
+# min_vol: Volume tối thiểu để đủ điều kiện reward
+# reward_tokens: Số lượng token reward
 ACTIVE_ALPHA_TOKENS = {
-    'US': {
-        'name': 'US Token',
-        'reward_tokens': 1000000,  # Số lượng token reward
-        'min_vol': 500,
-        'total_vol': 5000000,
-        'vol_change': 1200000,
-        'end_time': '2025-01-05 23:59',  # UTC
-        'status': 'active'
-    },
-    'STAR': {
-        'name': 'StarHeroes',
-        'reward_tokens': 50000,
-        'min_vol': 0,
-        'total_vol': 9800000,
-        'vol_change': 6300000,
-        'end_time': '2025-01-03 23:59',
-        'status': 'active'
-    },
     'KGEN': {
         'name': 'KGEN',
-        'reward_tokens': 100000,
-        'min_vol': 98882,
-        'total_vol': 552900000,
-        'vol_change': 59400000,
+        'reward_tokens': 47300,  # $47.3 reward
+        'min_vol': 134078,  # $134,078
+        'daily_vol': 172049442,  # $172M Daily Vol
+        'campaign_vol': 2145299052,  # $2.14B Camp Vol
+        'total_vol': 2145299052,
+        'vol_change': 35196,
         'end_time': '2025-01-07 23:59',
+        'status': 'active'
+    },
+    'TIMI': {
+        'name': 'TIMI',
+        'reward_tokens': 33600,  # $33.6 reward
+        'min_vol': 14,  # New Data
+        'daily_vol': 6906419,  # $6.9M Daily Vol
+        'campaign_vol': 73089216,  # $73M Camp Vol
+        'total_vol': 73089216,
+        'vol_change': 0,
+        'end_time': '2025-01-10 23:59',
         'status': 'active'
     },
     'RAVE': {
         'name': 'RAVE',
-        'reward_tokens': 80000,
-        'min_vol': 1526,
-        'total_vol': 43400000,
-        'vol_change': -9600000,
+        'reward_tokens': 30400,  # $30.4 reward
+        'min_vol': 2864,  # $2,864
+        'daily_vol': 13870066,  # $13.87M Daily Vol
+        'campaign_vol': 1003138995,  # $1B Camp Vol
+        'total_vol': 1003138995,
+        'vol_change': 1338,
         'end_time': '2025-01-04 23:59',
-        'status': 'active'
-    },
-    'ZKP': {
-        'name': 'ZKP Token',
-        'reward_tokens': 114486125,
-        'min_vol': 489,
-        'total_vol': 39400000,
-        'vol_change': -6300000,
-        'end_time': '2025-01-06 23:59',
         'status': 'active'
     },
     'CYS': {
         'name': 'Cysic',
-        'reward_tokens': 500000,
-        'min_vol': 1000,
-        'total_vol': 25000000,
+        'reward_tokens': 27100,  # $27.1 reward
+        'min_vol': 0,  # No Data
+        'daily_vol': 2994413,  # $2.99M Daily Vol
+        'campaign_vol': 276283989,  # $276M Camp Vol
+        'total_vol': 276283989,
+        'vol_change': 0,
+        'end_time': '2025-01-08 23:59',
+        'status': 'active'
+    },
+    'STAR': {
+        'name': 'StarHeroes',
+        'reward_tokens': 26200,  # $26.2 reward
+        'min_vol': 13,  # New Data
+        'daily_vol': 9510934,  # $9.5M Daily Vol
+        'campaign_vol': 52551222,  # $52.5M Camp Vol
+        'total_vol': 52551222,
+        'vol_change': 0,
+        'end_time': '2025-01-03 23:59',
+        'status': 'active'
+    },
+    'ZKP': {
+        'name': 'ZKP Token',
+        'reward_tokens': 23700,  # $23.7 reward (in USD)
+        'min_vol': 987,  # $987
+        'daily_vol': 16508633,  # $16.5M Daily Vol
+        'campaign_vol': 494867834,  # $494M Camp Vol
+        'total_vol': 494867834,
+        'vol_change': 498,
+        'end_time': '2025-01-06 23:59',
+        'status': 'active'
+    },
+    'US': {
+        'name': 'US Token',
+        'reward_tokens': 16200,  # $16.2 reward
+        'min_vol': 21,  # $21
+        'daily_vol': 2596308,  # $2.6M Daily Vol
+        'campaign_vol': 108898876,  # $108M Camp Vol
+        'total_vol': 108898876,
         'vol_change': 3500000,
         'end_time': '2025-01-08 23:59',
         'status': 'active'
