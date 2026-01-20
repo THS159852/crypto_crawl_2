@@ -1,0 +1,9 @@
+worker: python bot.py
+
+
+
+
+
+
+
+

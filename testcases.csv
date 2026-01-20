@@ -1,0 +1,15 @@
+Request,Test Case,Expected Result
+Request 1: Change the destination of the Web TOP search box,Verify the search box is displayed on Web TOP page (https://portal.uqmobile.jp/),Search box is displayed correctly
+Request 1: Change the destination of the Web TOP search box,Verify clicking the search box navigates to the new URL,User is redirected to http://portal.uqmobile.jp/search/web
+Request 1: Change the destination of the Web TOP search box,Verify the old URL (https://search.portal.uqmobile.jp/web) is no longer used,Old URL is not accessible or redirects to new URL
+Request 1: Change the destination of the Web TOP search box,Verify entering search keyword and clicking 検索 button works correctly,Search results are displayed on the new search page
+Request 1: Change the destination of the Web TOP search box,Verify the search box accepts text input,User can type search keywords in the search box
+Request 2: Change the destination when pressing the search magnifying glass icon on App TOP,Verify the magnifying glass icon is displayed on App TOP,Magnifying glass search icon is visible in the header
+Request 2: Change the destination when pressing the search magnifying glass icon on App TOP,Verify tapping the magnifying glass icon navigates to the same destination as item 1,User is redirected to http://portal.uqmobile.jp/search/web
+Request 2: Change the destination when pressing the search magnifying glass icon on App TOP,Verify the search functionality works after tapping the magnifying glass icon,Search page is displayed and user can perform search
+Request 3: Remove the magnifying glass icon in the header on Web article detail pages,Verify the magnifying glass icon is NOT displayed on Web article detail pages,Magnifying glass icon is removed/hidden from the header
+Request 3: Remove the magnifying glass icon in the header on Web article detail pages,Verify the magnifying glass icon is NOT displayed on new article list pages,Magnifying glass icon is removed/hidden from the header
+Request 3: Remove the magnifying glass icon in the header on Web article detail pages,Verify other header elements remain intact after removing the magnifying glass icon,Other header elements (back button and title etc.) are displayed correctly
+Request 3: Remove the magnifying glass icon in the header on Web article detail pages,Verify the header layout is not broken after removing the magnifying glass icon,Header layout remains clean and properly aligned
+Request 3: Remove the magnifying glass icon in the header on Web article detail pages,Verify the magnifying glass icon is still displayed on App TOP and Web TOP,Icon is only removed from article pages not from TOP pages
+

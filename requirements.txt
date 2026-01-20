@@ -1,0 +1,22 @@
+# Telegram Bot Dependencies
+python-telegram-bot==21.7
+python-telegram-bot[job-queue]==21.7
+
+# Async HTTP Client (thay thế requests)
+aiohttp>=3.11.0
+
+# Caching
+cachetools>=5.5.0
+
+# Crypto Exchange APIs
+ccxt>=4.4.0
+
+# Data Processing
+pandas>=2.2.0
+
+# Charting
+mplfinance>=0.12.10b0
+matplotlib>=3.9.0
+
+# Environment Variables
+python-dotenv>=1.0.0
