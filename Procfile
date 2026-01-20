@@ -4,6 +4,3 @@ worker: python bot.py
 
 
 
-
-
-
